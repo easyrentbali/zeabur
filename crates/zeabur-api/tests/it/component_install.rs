@@ -246,7 +246,115 @@ async fn component_install_traefik_reports_existing_ingress_owner_instead_of_man
     let reasons = view["reasons"].to_string();
     assert!(reasons.contains("erb-nginx"),"{view}");
     assert!(!reasons.contains("unsupported"),"{view}");
+    let (status, refused) = send(&app(&cluster), "POST", PLAN, Some(&json!({
+        "component": "ingress/traefik", "profile": "single-node"
+    }))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(writes(&cluster),0);
+}
+
+#[tokio::test]
+async fn component_install_complementary_components_can_share_a_capability() {
+    for (component, existing_crd) in [
+        ("event-autoscaling/keda-http-add-on", "scaledobjects.keda.sh"),
+        ("databases/dragonfly-operator", "perconaservermongodbs.psmdb.percona.com"),
+        ("volume-backup/k8up", "backups.velero.io"),
+    ] {
+        let cluster = cluster();
+        cluster.update(|state| { state.facts.crds.insert(existing_crd.to_owned()); });
+        let router = app(&cluster);
+        let path = format!("/api/v1/cluster/components/{component}/installation");
+        let (status, view) = send(&router, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{component}: {view}");
+        assert_eq!(view["installable"], true, "{component}: {view}");
+        assert_eq!(view["state"], "notInstalled", "{component}: {view}");
+        let (status, planned) = send(&router, "POST", PLAN, Some(&json!({
+            "component": component, "profile": "single-node"
+        }))).await;
+        assert_eq!(status, StatusCode::OK, "{component}: {planned}");
+        assert_eq!(writes(&cluster), 0, "eligibility and preview stay read-only");
+    }
+}
+
+#[tokio::test]
+async fn component_install_http_add_on_still_requires_keda() {
+    let cluster = cluster();
+    let (status, refused) = send(&app(&cluster), "POST", PLAN, Some(&json!({
+        "component": "event-autoscaling/keda-http-add-on", "profile": "single-node"
+    }))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(refused.to_string().contains("Missing prerequisite event-autoscaling/keda"), "{refused}");
+    assert_eq!(writes(&cluster), 0);
+}
+
+#[tokio::test]
+async fn component_install_detected_same_component_is_still_external() {
+    let cluster = cluster();
+    cluster.update(|state| { state.facts.crds.insert("dragonflies.dragonflydb.io".to_owned()); });
+    let path = "/api/v1/cluster/components/databases/dragonfly-operator/installation";
+    let (status, view) = send(&app(&cluster), "GET", path, None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["installable"], false, "{view}");
+    assert_eq!(view["state"], "external", "{view}");
+    let (status, refused) = send(&app(&cluster), "POST", PLAN, Some(&json!({
+        "component": "databases/dragonfly-operator", "profile": "single-node"
+    }))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(writes(&cluster), 0);
+}
+
+#[tokio::test]
+async fn component_install_optional_absent_integration_does_not_add_a_prerequisite() {
+    let cluster = cluster();
+    cluster.update(|state| {
+        state.facts.helm_releases.insert("observability/victoria-metrics-operator".to_owned());
+        state.facts.api_services.insert("v1beta1.metrics.k8s.io".to_owned());
+    });
+    let router = app(&cluster);
+    let path = "/api/v1/cluster/components/metrics/victoria-metrics/installation";
+    let (status, view) = send(&router, "GET", path, None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["installable"], true, "{view}");
+    let (status, planned) = send(&router, "POST", PLAN, Some(&json!({
+        "component": "metrics/victoria-metrics", "profile": "single-node"
+    }))).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    assert!(!planned["phases"].as_array().unwrap().iter().any(|phase|
+        phase["title"] == "Integrate prerequisite releases"), "absent optional Falco has no writes: {planned}");
+    assert_eq!(writes(&cluster), 0);
+}
+
+#[tokio::test]
+async fn component_install_optional_integration_never_takes_over_an_external_target() {
+    let cluster = cluster();
+    cluster.update(|state| {
+        state.facts.helm_releases.insert("observability/victoria-metrics-operator".to_owned());
+        state.dynamic.push(serde_json::from_value(json!({
+            "apiVersion": "helm.cattle.io/v1", "kind": "HelmChart",
+            "metadata": {"name": "falco", "namespace": "kube-system", "uid": "external-falco", "resourceVersion": "1"},
+            "spec": {"chart": "foreign-falco"}
+        })).unwrap());
+    });
+    let (status, refused) = send(&app(&cluster), "POST", PLAN, Some(&json!({
+        "component": "metrics/victoria-metrics", "profile": "single-node"
+    }))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(refused.to_string().contains("dashboard-owned release falco"), "{refused}");
+    assert_eq!(writes(&cluster), 0);
+}
+
+#[tokio::test]
+async fn component_install_required_integration_target_cannot_be_skipped() {
+    let cluster = cluster();
+    cluster.update(|state| {
+        state.facts.ingress_controllers.insert("traefik.io/ingress-controller".to_owned());
+    });
+    let (status, refused) = send(&app(&cluster), "POST", PLAN, Some(&json!({
+        "component": "intrusion-prevention/crowdsec", "profile": "single-node"
+    }))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(refused.to_string().contains("dashboard-owned release traefik"), "{refused}");
+    assert_eq!(writes(&cluster), 0);
 }
 
 #[tokio::test]

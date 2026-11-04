@@ -31,6 +31,38 @@ pub(super) fn required(shape: &native::NativeInstall) -> bool {
         || shape.objects.iter().any(|o| !matches!(text(&o.object,"/kind"),"Namespace" | "Secret" | "HelmChart"))
 }
 
+#[cfg(test)]
+mod component_install_contribution_tests {
+    use super::*;
+
+    fn shape() -> native::NativeInstall {
+        native::NativeInstall { releases:Vec::new(),objects:Vec::new(),pod_security:None,phases:Vec::new(),
+            contributions:vec![
+                native::NativeContribution { component:"optional/absent".to_owned(),release:"first".to_owned(),values:json!({"wrong":true}) },
+                native::NativeContribution { component:"metrics/target".to_owned(),release:"second".to_owned(),values:json!({"correct":true}) },
+            ] }
+    }
+
+    fn selected() -> Contribution {
+        Contribution { component:"metrics/target".to_owned(),before:json!({"metadata":{"name":"second"}}),after:Value::Null }
+    }
+
+    #[test]
+    fn skipped_optional_contribution_does_not_shift_preview_target() {
+        let preview: Value = serde_saphyr::from_str(&contribution_preview(&shape(),&selected()).unwrap()).unwrap();
+        assert_eq!(preview,json!({"correct":true}));
+    }
+
+    #[test]
+    fn ambiguous_or_changed_contribution_targets_are_refused() {
+        let mut shape = shape();
+        let mut changed = selected();changed.component = "other/target".to_owned();
+        assert!(contribution_preview(&shape,&changed).is_err());
+        shape.contributions.push(shape.contributions[1].clone());
+        assert!(contribution_preview(&shape,&selected()).is_err());
+    }
+}
+
 fn digest(shape: &native::NativeInstall) -> Result<String,ApiError> {
     let objects: Vec<_> = shape.objects.iter().map(|o| &o.object).collect();
     let contributions: Vec<_> = shape.contributions.iter().map(|c| json!({"component":c.component,"release":c.release,"values":c.values})).collect();
@@ -80,12 +112,16 @@ fn merge(target: &mut Value, patch: &Value) {
     } else { *target = patch.clone(); }
 }
 
-async fn contributions(cluster: &dyn Cluster, shape: &native::NativeInstall) -> Result<Vec<Contribution>,ApiError> {
+async fn contributions(cluster: &dyn Cluster, shape: &native::NativeInstall, guide: &install::InstallGuide) -> Result<Vec<Contribution>,ApiError> {
     let mut result = Vec::new();
     for entry in &shape.contributions {
         let object = json!({"apiVersion":"helm.cattle.io/v1","kind":"HelmChart","metadata":{"name":entry.release,"namespace":"kube-system"}});
-        let before = find(cluster,&object).await?.ok_or_else(|| problem(Kind::Conflict,format!("Configuration integration requires dashboard-owned release {}. An absent or external release cannot be modified.",entry.release)))?;
+        let before = find(cluster,&object).await?;
         let target_record = find(cluster,&receipt(&entry.component)).await?;
+        if before.is_none() && target_record.is_none() && !guide.requires.contains(&entry.component) {
+            continue;
+        }
+        let before = before.ok_or_else(|| problem(Kind::Conflict,format!("Configuration integration requires dashboard-owned release {}. An absent or external release cannot be modified.",entry.release)))?;
         if !inspect::same_install(&before,target_record.as_ref(),&entry.component) {
             return Err(problem(Kind::Conflict,format!("Release {} is managed elsewhere; the dashboard will not change its configuration.",entry.release)));
         }
@@ -99,8 +135,19 @@ async fn contributions(cluster: &dyn Cluster, shape: &native::NativeInstall) -> 
     Ok(result)
 }
 
+fn contribution_preview(shape: &native::NativeInstall, contribution: &Contribution) -> Result<String,ApiError> {
+    let mut entries = shape.contributions.iter().filter(|entry| entry.component == contribution.component
+        && entry.release == text(&contribution.before,"/metadata/name"));
+    let entry = entries.next().ok_or_else(|| problem(Kind::Conflict,"The reviewed integration target changed."))?;
+    if entries.next().is_some() {
+        return Err(problem(Kind::Conflict,"The reviewed integration target is ambiguous."));
+    }
+    serde_saphyr::to_string(&entry.values).map_err(|_| problem(Kind::Internal,"Cannot render integration preview."))
+}
+
 pub(super) async fn plan(cluster: &dyn Cluster,state: &AppState,request: InstallRequest,shape: native::NativeInstall,view: inspect::Inspection,identity: Identity,install_id: String,generated: Vec<String>) -> Result<InstallPlan,ApiError> {
-    let integrations = contributions(cluster,&shape).await?;
+    let guide = install::guide(&request.component,&request.profile).map_err(|_| problem(Kind::Conflict,"The installation catalogue changed."))?;
+    let integrations = contributions(cluster,&shape,&guide).await?;
     let phases = shape.phases.iter().enumerate().map(|(index,phase)| {
         Ok(InstallPhase { index,title:phase.name.clone(),resources:phase.objects.iter().filter_map(|i| shape.objects.get(*i)).map(|o| reference_of(&o.object)).collect::<Result<Vec<_>,ApiError>>()? })
     }).collect::<Result<Vec<_>,ApiError>>()?;
@@ -115,10 +162,10 @@ pub(super) async fn plan(cluster: &dyn Cluster,state: &AppState,request: Install
     let mut phases = phases;
     if !integrations.is_empty() {
         phases.push(InstallPhase { index:phases.len(),title:"Integrate prerequisite releases".to_owned(),resources:integrations.iter().map(|c| reference_of(&c.before)).collect::<Result<Vec<_>,ApiError>>()? });
-        for (integration,entry) in integrations.iter().zip(&shape.contributions) {
+        for integration in &integrations {
             writes.push(InstallWrite { kind:"HelmChart".to_owned(),name:text(&integration.before,"/metadata/name").to_owned(),namespace:"kube-system".to_owned(),
                 before_yaml:Some("Existing values are preserved; sensitive values are hidden.".to_owned()),
-                after_yaml:serde_saphyr::to_string(&entry.values).map_err(|_| problem(Kind::Internal,"Cannot render integration preview."))? });
+                after_yaml:contribution_preview(&shape,integration)? });
         }
     }
     let expires_at = (state.clock)().as_second().saturating_add(LIFETIME_SECONDS);
@@ -130,7 +177,7 @@ pub(super) async fn plan(cluster: &dyn Cluster,state: &AppState,request: Install
 }
 
 fn seal(state: &AppState,claims: &Claims) -> Result<String,ApiError> {
-    token::sign_as(&sealing(state)?,PREFIX,claims).map_err(|_| problem(Kind::Internal,"Cannot seal installation continuation."))
+    token::sign_as(sealing(state)?.as_ref(),PREFIX,claims).map_err(|_| problem(Kind::Internal,"Cannot seal installation continuation."))
 }
 
 async fn find(cluster: &dyn Cluster,object: &Value) -> Result<Option<Value>,ApiError> {
@@ -392,7 +439,7 @@ async fn latest(cluster: &dyn Cluster,state: &AppState,component: &str) -> Resul
         return Err(problem(Kind::Conflict,"An installation phase stopped or has an uncertain outcome. No phase writes will be replayed."));
     }
     let next = text(&marker,"/data/nextToken");
-    let claims: Claims = token::open_as(&sealing(state)?,PREFIX,next).map_err(token_problem)?;
+    let claims: Claims = token::open_as(sealing(state)?.as_ref(),PREFIX,next).map_err(token_problem)?;
     let index: usize = text(&marker,"/data/phase").parse().map_err(|_| problem(Kind::Conflict,"Malformed installation phase index."))?;
     if claims.component != component || claims.install_id != root_id || claims.phased.as_ref().is_none_or(|p| p.phase != index + 1) {
         return Err(problem(Kind::Conflict,"The continuation does not belong to this installation."));
@@ -436,9 +483,9 @@ pub(super) async fn resume(cluster: &dyn Cluster,state: &AppState,component: &st
     }
     if !compact.contributions.is_empty() {
         let mut resources = Vec::new();
-        for (contribution,entry) in compact.contributions.iter().zip(&shape.contributions) {
+        for contribution in &compact.contributions {
             let reference = reference_of(&contribution.before)?;resources.push(reference.clone());
-            writes.push(InstallWrite { kind:reference.kind,name:reference.name,namespace:reference.namespace,before_yaml:Some("Existing values are preserved; sensitive values are hidden.".to_owned()),after_yaml:serde_saphyr::to_string(&entry.values).map_err(|_| problem(Kind::Internal,"Cannot render integration preview."))? });
+            writes.push(InstallWrite { kind:reference.kind,name:reference.name,namespace:reference.namespace,before_yaml:Some("Existing values are preserved; sensitive values are hidden.".to_owned()),after_yaml:contribution_preview(&shape,contribution)? });
         }
         stages.push(InstallPhase { index:shape.phases.len(),title:"Integrate prerequisite releases".to_owned(),resources });
     }

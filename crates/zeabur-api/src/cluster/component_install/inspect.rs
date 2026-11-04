@@ -225,13 +225,25 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
         let record = receipt(&contribution.component);
         let (record_ref,target) = resource(&record)?;
         let record = observe(cluster,&mut out.observations,&record_ref,"kube-system",&target.name).await?;
+        // Contributions integrate a selected target; they do not make an absent
+        // optional component a new prerequisite. A partial/external target still
+        // requires the original ownership checks and cannot be skipped/adopted.
+        if chart.is_none() && record.is_none() && !guide.requires.contains(&contribution.component) {
+            continue;
+        }
         if !chart.as_ref().is_some_and(|chart| same_install(chart,record.as_ref(),&contribution.component)) {
             out.reasons.push(format!("Configuration integration requires dashboard-owned release {}. An absent or external release cannot be modified.",contribution.release));
         }
     }
-    let capability = component.split_once('/').map(|(c,_)| c).unwrap_or_default();
-    if own_charts.is_empty() && capabilities.iter().any(|c| c.name == capability && c.existing) {
-        out.state = "external".to_owned(); out.reasons.push(format!("Capability {capability} already has an existing provider; installation will not replace it."));
+    let (capability,id) = component.split_once('/').unwrap_or_default();
+    // Catalogue capabilities group complementary providers too: KEDA's HTTP add-on
+    // requires KEDA, and database operators or backup tools can coexist. Only
+    // detection of this exact component establishes that it already exists.
+    // Real replacements remain guarded by packaged add-ons, exact objects/Helm
+    // releases above and the independent ingress ownership checks below.
+    if own_charts.is_empty() && capabilities.iter().any(|c| c.name == capability
+        && c.installations.iter().any(|installed| installed.component == id)) {
+        out.state = "external".to_owned(); out.reasons.push(format!("Component {component} already exists and is managed elsewhere; installation will not replace it."));
     }
     if own_charts.is_empty() && (capability.contains("ingress") || component.ends_with("/traefik") || component.ends_with("/ingress-nginx")) {
         out.reasons.extend(ingress_conflicts(cluster,&mut out.observations).await?);
