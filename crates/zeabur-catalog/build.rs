@@ -85,7 +85,11 @@ fn verify_native_assets() -> Result<(), String> {
         let path = root.join(file);
         println!("cargo::rerun-if-changed={}",path.display());
         let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-        if format!("{:x}",Sha256::digest(&bytes)) != entry["sha256"].as_str().ok_or("asset checksum is missing")? {
+        let checksum = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if checksum != entry["sha256"].as_str().ok_or("asset checksum is missing")? {
             return Err(format!("checksum mismatch for {file}"));
         }
     }
