@@ -223,6 +223,7 @@ macro_rules! handlers {
             cluster::capabilities,
             cluster::component_install::get,
             cluster::component_install::plan,
+            cluster::component_install::resume,
             cluster::component_install::apply,
             cluster::backups::get,
             cluster::backups::plan,

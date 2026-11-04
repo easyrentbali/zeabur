@@ -1,5 +1,8 @@
 //! Typed, create-only Kubernetes rendering. No shell commands or placeholder substitution.
 
+mod manifests;
+pub use manifests::resource as manifest_resource;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
@@ -21,12 +24,30 @@ pub struct NativeObject {
     pub preview: Value,
 }
 
+/// One reviewed reconciliation boundary. The next phase waits for these objects/releases.
+#[derive(Debug, Clone)]
+pub struct NativePhase {
+    pub name: String,
+    pub objects: Vec<usize>,
+    pub releases: Vec<NativeRelease>,
+}
+
+/// A narrowly scoped values merge into another dashboard-owned release.
+#[derive(Debug, Clone)]
+pub struct NativeContribution {
+    pub component: String,
+    pub release: String,
+    pub values: Value,
+}
+
 /// A supported install, in dependency order: namespaces, Secrets, HelmCharts.
 #[derive(Debug, Clone)]
 pub struct NativeInstall {
     pub releases: Vec<NativeRelease>,
     pub objects: Vec<NativeObject>,
     pub pod_security: Option<String>,
+    pub phases: Vec<NativePhase>,
+    pub contributions: Vec<NativeContribution>,
 }
 
 /// Render bundled catalogue data into objects. Randomness is supplied by the caller's CSPRNG.
@@ -68,6 +89,9 @@ fn input_value(
     random: &mut impl FnMut(usize, &str) -> Result<String, String>,
 ) -> Result<Value, String> {
     if let Some(generator) = &input.generate {
+        if generator == "clusterIP" {
+            return Err("Builder installation requires a reserved ServiceCIDR address and node registry CA trust. Configure the existing build integration before installing Builder from the dashboard.".to_owned());
+        }
         if supplied.is_some() || generator != "random" {
             return Err(format!("Input {} must use its supported server generator.", input.name));
         }
@@ -113,11 +137,8 @@ fn render_file(
     inputs: &BTreeMap<String, String>,
     random: &mut impl FnMut(usize, &str) -> Result<String, String>,
 ) -> Result<NativeInstall, String> {
-    if !file.contributes.is_empty() {
-        return Err("This component changes another component's release; use reviewed GitOps instead.".to_owned());
-    }
-    if file.releases.is_empty() || file.releases.iter().any(|r| !matches!(r.source(), Some(Source::Oci { .. } | Source::Repo { .. }))) {
-        return Err("This component includes manifests or remote URLs unsupported by dashboard installation.".to_owned());
+    if file.releases.is_empty() {
+        return Err("The component has no installation resources.".to_owned());
     }
     if inputs.len() > 64 || inputs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() > 65_536
         || inputs.keys().any(|k| !file.inputs.iter().any(|i| i.name == *k)) {
@@ -162,7 +183,25 @@ fn render_file(
     }
     let first = file.releases.first().map(|r| r.name.as_str());
     let mut releases = Vec::new();
+    let mut phases = Vec::new();
     for release in &file.releases {
+        let start = if phases.is_empty() { 0 } else { objects.len() };
+        if !matches!(release.source(), Some(Source::Oci { .. } | Source::Repo { .. })) {
+            let direct = manifests::render(release)?;
+            for object in direct {
+                if object.get("kind").and_then(Value::as_str) == Some("Namespace") {
+                    let ns = object.pointer("/metadata/name").and_then(Value::as_str).ok_or("Invalid manifest namespace.")?;
+                    if !objects.iter().any(|o| o.object.get("kind").and_then(Value::as_str) == Some("Namespace")
+                        && o.object.pointer("/metadata/name").and_then(Value::as_str) == Some(ns)) {
+                        return Err("A bundled manifest uses an undeclared namespace.".to_owned());
+                    }
+                    continue;
+                }
+                objects.push(NativeObject { preview: object.clone(), object });
+            }
+            phases.push(NativePhase { name:release.name.clone(), objects:(start..objects.len()).collect(), releases:Vec::new() });
+            continue;
+        }
         if release.version.as_deref().is_none_or(|v| v.is_empty() || v.contains(['<', '$', '{']) || matches!(v, "latest" | "nightly")) {
             return Err("Dashboard installation requires a pinned chart version.".to_owned());
         }
@@ -187,9 +226,19 @@ fn render_file(
             object: serde_saphyr::from_str(&yaml).map_err(|_| "Cannot decode chart.")?,
             preview: serde_saphyr::from_str(&safe).map_err(|_| "Cannot decode chart preview.")?,
         });
-        releases.push(NativeRelease { name: release.release_name().to_owned(), namespace: release.namespace.clone(), skip_if_present: release.skip_if_present.clone() });
+        let native = NativeRelease { name: release.release_name().to_owned(), namespace: release.namespace.clone(), skip_if_present: release.skip_if_present.clone() };
+        phases.push(NativePhase { name:release.name.clone(), objects:(start..objects.len()).collect(), releases:vec![native.clone()] });
+        releases.push(native);
     }
-    Ok(NativeInstall { releases, objects, pod_security: security.map(str::to_owned) })
+    // Existing chart-only installs retain their single create-only transaction.
+    if file.releases.iter().all(|r| r.is_chart()) && file.contributes.is_empty() {
+        phases = vec![NativePhase { name:"Install Helm releases".to_owned(), objects:(0..objects.len()).collect(), releases:releases.clone() }];
+    }
+    let contributions = file.contributes.iter().map(|c| {
+        if c.release.is_empty() || c.values.is_empty() { return Err("Invalid catalogue release contribution.".to_owned()); }
+        Ok(NativeContribution { component:c.target.clone(), release:c.release.clone(), values:parse_values(Some(&c.values))? })
+    }).collect::<Result<Vec<_>,String>>()?;
+    Ok(NativeInstall { releases, objects, pod_security: security.map(str::to_owned), phases, contributions })
 }
 
 #[cfg(test)]
@@ -250,5 +299,35 @@ releases:
         let manifest: File = serde_saphyr::from_str("releases: [{name: unsafe, namespace: x, manifests: 'kind: Namespace'}]").unwrap();
         assert!(render_file(&manifest, "single-node", &BTreeMap::new(), &mut random).is_err());
         assert!(render("no/such-component", "single-node", &BTreeMap::new(), random).is_err());
+    }
+
+    #[test]
+    fn native_supports_every_bundled_primitive_and_explains_builder_prerequisite() {
+        for (capability,id,_) in bundle::FILES {
+            let component = format!("{capability}/{id}");
+            for profile in PROFILES {
+                let shape = describe(&component,profile);
+                if component == "builds/zeabur-builder" {
+                    assert!(shape.unwrap_err().contains("ServiceCIDR"));
+                } else {
+                    let shape = shape.unwrap_or_else(|e| panic!("{component}/{profile}: {e}"));
+                    assert!(!shape.phases.is_empty(),"{component}");
+                    let indexes: Vec<_> = shape.phases.iter().flat_map(|p| p.objects.iter().copied()).collect();
+                    assert_eq!(indexes,(0..shape.objects.len()).collect::<Vec<_>>(),"Every object is reviewed in exactly one phase: {component}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn traefik_crds_precede_helm_and_suc_has_direct_controller_phase() {
+        let traefik = describe("ingress/traefik","multi-node").unwrap();
+        assert_eq!(traefik.phases.len(),2);
+        assert!(traefik.phases[0].releases.is_empty());
+        assert_eq!(traefik.phases[1].releases[0].name,"traefik");
+        let suc = describe("node-updates/system-upgrade-controller","multi-node").unwrap();
+        assert!(suc.releases.is_empty());
+        assert_eq!(suc.phases.len(),2);
+        assert!(suc.objects.iter().any(|o| o.object["kind"] == "Deployment"));
     }
 }

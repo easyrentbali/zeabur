@@ -231,3 +231,120 @@ async fn component_install_requires_deployed_release_and_current_healthy_workloa
     assert_eq!(ready["state"], "installed");
     assert_eq!(writes(&cluster), 3, "progress polling is read-only");
 }
+
+#[tokio::test]
+async fn component_install_traefik_reports_existing_ingress_owner_instead_of_manifest_error() {
+    let cluster = cluster();
+    cluster.update(|state| state.dynamic.push(serde_json::from_value(json!({
+        "apiVersion":"networking.k8s.io/v1","kind":"IngressClass",
+        "metadata":{"name":"erb-nginx","uid":"nginx-owner","resourceVersion":"1"},
+        "spec":{"controller":"k8s.io/ingress-nginx"}
+    })).unwrap()));
+    let (status,view) = send(&app(&cluster),"GET","/api/v1/cluster/components/ingress/traefik/installation",None).await;
+    assert_eq!(status,StatusCode::OK,"{view}");
+    assert_eq!(view["installable"],false);
+    let reasons = view["reasons"].to_string();
+    assert!(reasons.contains("erb-nginx"),"{view}");
+    assert!(!reasons.contains("unsupported"),"{view}");
+    assert_eq!(writes(&cluster),0);
+}
+
+#[tokio::test]
+async fn component_install_manifest_phases_wait_for_crds_refuse_replay_and_poll_read_only() {
+    let cluster = cluster();let router = app(&cluster);
+    let (status,planned) = send(&router,"POST",PLAN,Some(&json!({"component":"node-updates/system-upgrade-controller","profile":"single-node"}))).await;
+    assert_eq!(status,StatusCode::OK,"{planned}");
+    assert_eq!(planned["phases"].as_array().unwrap().len(),2);
+    assert!(planned["token"].as_str().unwrap().len() < 32_768,"CRD schemas must not inflate sealed token");
+    assert_eq!(writes(&cluster),0);
+    let (status,submitted) = apply(&router,&planned).await;
+    assert_eq!(status,StatusCode::OK,"{submitted}");
+    assert_eq!(submitted["phase"],1);
+    let before = writes(&cluster);
+    let next = json!({"token":submitted["continuationToken"]});
+    let (status,waiting) = send(&router,"POST",APPLY,Some(&next)).await;
+    assert_eq!(status,StatusCode::OK,"{waiting}");
+    assert_eq!(waiting["state"],"waiting");
+    assert_eq!(writes(&cluster),before,"unestablished CRDs cannot permit next phase writes");
+    let (status,replayed) = apply(&router,&planned).await;
+    assert_eq!(status,StatusCode::CONFLICT,"{replayed}");
+    assert_eq!(writes(&cluster),before);
+    let url = "/api/v1/cluster/components/node-updates/system-upgrade-controller/installation";
+    let (status,pending) = send(&router,"GET",url,None).await;
+    assert_eq!(status,StatusCode::OK,"{pending}");assert_eq!(pending["state"],"pending");
+    assert_eq!(pending["continuationToken"],submitted["continuationToken"]);
+    assert_eq!(writes(&cluster),before,"GET must never install");
+    cluster.update(|state| {
+        for object in &mut state.dynamic {
+            if object.types.as_ref().is_some_and(|t| t.kind == "CustomResourceDefinition") && object.metadata.name.as_deref() == Some("plans.upgrade.cattle.io") {
+                object.data["status"] = json!({"conditions":[{"type":"Established","status":"True"}]});
+            }
+        }
+    });
+    let (status,continued) = send(&router,"POST",APPLY,Some(&next)).await;
+    assert_eq!(status,StatusCode::OK,"{continued}");assert_eq!(continued["phase"],2);
+    let final_token = json!({"token":continued["continuationToken"]});
+    let after = writes(&cluster);
+    let (status,unready) = send(&router,"POST",APPLY,Some(&final_token)).await;
+    assert_eq!(status,StatusCode::OK,"{unready}");assert_eq!(unready["state"],"waiting");
+    assert_eq!(writes(&cluster),after,"submission of SUC deployment is not readiness");
+}
+
+#[tokio::test]
+async fn component_install_continuation_rechecks_identity_and_prior_object_configuration() {
+    let cluster = cluster();let router = app(&cluster);
+    let (status,planned) = send(&router,"POST",PLAN,Some(&json!({"component":"node-updates/system-upgrade-controller","profile":"single-node"}))).await;
+    assert_eq!(status,StatusCode::OK,"{planned}");
+    let (status,submitted) = apply(&router,&planned).await;assert_eq!(status,StatusCode::OK,"{submitted}");
+    let before = writes(&cluster);let next = json!({"token":submitted["continuationToken"]});
+    cluster.update(|state| state.identity.username = "other-admin".to_owned());
+    let (status,refused) = send(&router,"POST",APPLY,Some(&next)).await;
+    assert_eq!(status,StatusCode::FORBIDDEN,"{refused}");assert_eq!(writes(&cluster),before);
+    cluster.update(|state| {
+        state.identity.username = "zeabur:owner@example.test".to_owned();
+        for object in &mut state.dynamic {
+            if object.metadata.name.as_deref() == Some("plans.upgrade.cattle.io") { object.data["spec"]["scope"] = json!("Cluster"); }
+        }
+    });
+    let (status,changed) = send(&router,"POST",APPLY,Some(&next)).await;
+    assert_eq!(status,StatusCode::CONFLICT,"{changed}");assert_eq!(writes(&cluster),before);
+}
+
+#[tokio::test]
+async fn component_install_expired_consent_requires_explicit_read_only_remaining_review() {
+    use std::sync::{Arc,atomic::{AtomicI64,Ordering}};
+    use zeabur_kube::k8s_openapi::jiff::Timestamp;
+    static NOW: AtomicI64 = AtomicI64::new(1_000);
+    fn clock() -> Timestamp { Timestamp::from_second(NOW.load(Ordering::SeqCst)).unwrap() }
+    NOW.store(1_000,Ordering::SeqCst);
+    let cluster = cluster();
+    let router = zeabur_api::router_at(Arc::new(zeabur_api::access::SingleCluster(Arc::new(cluster.clone()))),clock);
+    let request = json!({"component":"node-updates/system-upgrade-controller","profile":"single-node"});
+    let (status,planned) = send(&router,"POST",PLAN,Some(&request)).await;assert_eq!(status,StatusCode::OK,"{planned}");
+    let (status,submitted) = apply(&router,&planned).await;assert_eq!(status,StatusCode::OK,"{submitted}");
+    let before = writes(&cluster);
+    NOW.store(1_700,Ordering::SeqCst);
+    let path = "/api/v1/cluster/components/node-updates/system-upgrade-controller/installation";
+    let (status,expired) = send(&router,"GET",path,None).await;assert_eq!(status,StatusCode::OK,"{expired}");
+    assert_eq!(expired["resumeAvailable"],true);assert!(expired["continuationToken"].is_null());
+    let (status,refused) = send(&router,"POST",APPLY,Some(&json!({"token":submitted["continuationToken"]}))).await;
+    assert_ne!(status,StatusCode::OK,"{refused}");assert_eq!(writes(&cluster),before);
+    let resume = "/api/v1/cluster/components/install/resume-plan";
+    cluster.update(|state| state.identity.username = "another-admin".to_owned());
+    let (status,refused) = send(&router,"POST",resume,Some(&json!({"component":"node-updates/system-upgrade-controller"}))).await;
+    assert_eq!(status,StatusCode::FORBIDDEN,"{refused}");
+    cluster.update(|state| state.identity.username = "zeabur:owner@example.test".to_owned());
+    let (status,review) = send(&router,"POST",resume,Some(&json!({"component":"node-updates/system-upgrade-controller"}))).await;
+    assert_eq!(status,StatusCode::OK,"{review}");assert_eq!(writes(&cluster),before,"resume review is read-only");
+    assert_eq!(review["phases"].as_array().unwrap().len(),1);
+    assert!(review["writes"].as_array().unwrap().iter().all(|w| w["kind"] != "CustomResourceDefinition"),"completed CRDs must never be replayed");
+    let (status,waiting) = apply(&router,&review).await;assert_eq!(status,StatusCode::OK,"{waiting}");
+    assert_eq!(waiting["state"],"waiting");assert_eq!(writes(&cluster),before);
+    cluster.update(|state| {
+        for object in &mut state.dynamic {
+            if object.metadata.name.as_deref() == Some("plans.upgrade.cattle.io") { object.data["spec"]["newUnreviewedField"] = json!(true); }
+        }
+    });
+    let (status,changed) = send(&router,"POST",resume,Some(&json!({"component":"node-updates/system-upgrade-controller"}))).await;
+    assert_eq!(status,StatusCode::CONFLICT,"{changed}");assert_eq!(writes(&cluster),before);
+}

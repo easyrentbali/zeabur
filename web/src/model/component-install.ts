@@ -39,6 +39,19 @@ export function installationIsComplete(state: string): boolean {
   return state === "installed"
 }
 
+/** Only a server-issued continuation for a still-pending reviewed installation may advance. */
+export function nextInstallationToken(
+  info: { state: string; continuationToken?: string | null; phase?: number; totalPhases?: number; resumeAvailable?: boolean } | undefined,
+  submitted: ReadonlySet<string>,
+): string | undefined {
+  if (!info || info.state !== "pending" || info.resumeAvailable || !info.continuationToken ||
+      !Number.isInteger(info.phase) || !Number.isInteger(info.totalPhases) ||
+      info.phase! < 0 || info.phase! >= info.totalPhases! || submitted.has(info.continuationToken)) {
+    return undefined
+  }
+  return info.continuationToken
+}
+
 export function canApplyComponentPlan(
   plan: {
     component: string

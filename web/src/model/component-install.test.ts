@@ -6,6 +6,7 @@ import {
   installationIsComplete,
   missingComponentInputs,
   providedComponentInputs,
+  nextInstallationToken,
 } from "./component-install"
 
 test("installation paths require a catalog capability and component", () => {
@@ -64,4 +65,16 @@ test("only a current matching plan with writes can be applied", () => {
   expect(canApplyComponentPlan({ ...plan, expiresAt: "2026-11-04T04:00:00Z" }, plan.component, plan.profile, now)).toBe(false)
   expect(canApplyComponentPlan({ ...plan, token: "" }, plan.component, plan.profile, now)).toBe(false)
   expect(canApplyComponentPlan({ ...plan, writes: [] }, plan.component, plan.profile, now)).toBe(false)
+})
+
+test("only server-issued pending continuations may advance and submitted tokens never replay", () => {
+  const state = { state: "pending", continuationToken: "synthetic-next-phase", phase: 1, totalPhases: 3 }
+  expect(nextInstallationToken(state, new Set())).toBe(state.continuationToken)
+  expect(nextInstallationToken(state, new Set([state.continuationToken]))).toBeUndefined()
+  for (const status of ["installed", "external", "failed", "notInstalled"]) {
+    expect(nextInstallationToken({ ...state, state: status }, new Set())).toBeUndefined()
+  }
+  expect(nextInstallationToken({ ...state, continuationToken: null }, new Set())).toBeUndefined()
+  expect(nextInstallationToken({ ...state, phase: 3 }, new Set())).toBeUndefined()
+  expect(nextInstallationToken({ ...state, resumeAvailable: true }, new Set())).toBeUndefined()
 })

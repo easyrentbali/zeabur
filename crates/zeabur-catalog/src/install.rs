@@ -178,6 +178,10 @@ struct Detection {
 #[derive(Debug, Deserialize)]
 struct Contribution {
     target: String,
+    #[serde(default)]
+    release: String,
+    #[serde(default)]
+    values: String,
 }
 
 #[derive(Debug, Deserialize)]

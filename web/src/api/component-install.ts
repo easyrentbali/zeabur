@@ -11,6 +11,10 @@ export interface ComponentInstallation {
   state: "notInstalled" | "pending" | "installed" | "failed" | "external"
   resources: { kind: string; name: string; namespace: string }[]
   message: string
+  continuationToken?: string | null
+  phase?: number
+  totalPhases?: number
+  resumeAvailable: boolean
 }
 
 export interface ComponentInstallRequest {
@@ -32,12 +36,17 @@ export interface ComponentInstallPlan {
     afterYaml: string
   }[]
   warnings: string[]
+  phases?: { index: number; title: string; resources: { kind: string; name: string; namespace: string }[] }[]
 }
 
 export interface ComponentInstallSubmission {
   component: string
-  state: "submitted"
+  state: "submitted" | "waiting" | "installed"
   written: string[]
+  message?: string
+  continuationToken?: string | null
+  phase?: number
+  totalPhases?: number
 }
 
 export function getComponentInstallation(component: string, signal?: AbortSignal) {
@@ -50,6 +59,16 @@ export function planComponentInstall(request: ComponentInstallRequest, signal?: 
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(request),
+    signal,
+  })
+}
+
+/** Re-review expired consent without submitting or replaying any installation stage. */
+export function resumeComponentInstallPlan(component: string, signal?: AbortSignal) {
+  return zeaburFetch<ComponentInstallPlan>("/api/v1/cluster/components/install/resume-plan", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ component }),
     signal,
   })
 }

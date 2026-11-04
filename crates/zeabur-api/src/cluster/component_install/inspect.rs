@@ -9,14 +9,14 @@ pub(super) struct Inspection {
     pub existing_namespaces: Vec<String>,
 }
 
-fn reference_for(api: &str, plural: &str, kind: &str) -> ResourceRef {
+pub(super) fn reference_for(api: &str, plural: &str, kind: &str) -> ResourceRef {
     let (group, version) = api.split_once('/').unwrap_or(("", api));
     ResourceRef::new(group, version, plural, kind)
 }
 
 fn namespace(value: &str) -> Option<&str> { (!value.is_empty()).then_some(value) }
 
-async fn observe(cluster: &dyn Cluster, observations: &mut Vec<Observation>, reference: &ResourceRef, ns: &str, name: &str) -> Result<Option<Value>, ApiError> {
+pub(super) async fn observe(cluster: &dyn Cluster, observations: &mut Vec<Observation>, reference: &ResourceRef, ns: &str, name: &str) -> Result<Option<Value>, ApiError> {
     let object = cluster.find_object(reference, namespace(ns), name).await
         .map_err(|_| problem(Kind::Unavailable, format!("Cannot read {}/{}/{} for installation safety checks.",reference.kind,ns,name)))?;
     let value = object.map(serde_json::to_value).transpose().map_err(|_| problem(Kind::Internal,"Cannot decode component object."))?;
@@ -27,7 +27,7 @@ async fn observe(cluster: &dyn Cluster, observations: &mut Vec<Observation>, ref
     Ok(value)
 }
 
-async fn list(cluster: &dyn Cluster, resource: &ResourceRef, ns: Option<&str>) -> Result<Vec<Value>, ApiError> {
+pub(super) async fn list(cluster: &dyn Cluster, resource: &ResourceRef, ns: Option<&str>) -> Result<Vec<Value>, ApiError> {
     let objects = cluster.list_objects(resource,ns).await.map_err(|_| problem(Kind::Unavailable,format!("Cannot inspect {} for component conflicts.",resource.resource)))?;
     objects.unwrap_or_default().into_iter().map(|object| serde_json::to_value(object).map(|value| list_identity(value,resource))).collect::<Result<Vec<_>,_>>()
         .map_err(|_| problem(Kind::Internal,"Cannot decode component inventory."))
@@ -57,12 +57,12 @@ pub(super) async fn unchanged(cluster: &dyn Cluster, expected: &[Observation]) -
     Ok(())
 }
 
-fn owned(value: &Value, component: &str) -> bool {
+pub(super) fn owned(value: &Value, component: &str) -> bool {
     value.pointer("/metadata/labels").and_then(|v| v.get(OWNER)).and_then(Value::as_str) == Some("true")
         && value.pointer("/metadata/annotations").and_then(|v| v.get(COMPONENT)).and_then(Value::as_str) == Some(component)
 }
 
-fn same_install(value: &Value, record: Option<&Value>, component: &str) -> bool {
+pub(super) fn same_install(value: &Value, record: Option<&Value>, component: &str) -> bool {
     record.is_some_and(|record| {
         owned(value, component) && owned(record, component)
             && !text(record, "/metadata/annotations/zeabur.dev~1install-id").is_empty()
@@ -71,7 +71,7 @@ fn same_install(value: &Value, record: Option<&Value>, component: &str) -> bool 
     })
 }
 
-fn failed(value: &Value) -> bool {
+pub(super) fn failed(value: &Value) -> bool {
     let conditions = value.pointer("/status/conditions").and_then(Value::as_array);
     // Job failed-attempt counters survive successful retries. Only a terminal
     // condition proves failure; a completed Job must not regress to failed.
@@ -85,7 +85,7 @@ fn failed(value: &Value) -> bool {
     }))
 }
 
-fn healthy(value: &Value) -> bool {
+pub(super) fn healthy(value: &Value) -> bool {
     let number = |path| value.pointer(path).and_then(Value::as_u64).unwrap_or_default();
     if number("/status/observedGeneration") < number("/metadata/generation") { return false; }
     match text(value,"/kind") {
@@ -105,14 +105,14 @@ fn healthy(value: &Value) -> bool {
     }
 }
 
-fn belongs_to_release(value: &Value, release: &native::NativeRelease) -> bool {
+pub(super) fn belongs_to_release(value: &Value, release: &native::NativeRelease) -> bool {
     text(value,"/metadata/namespace") == release.namespace
         && (value.pointer("/metadata/labels").and_then(|v| v.get("app.kubernetes.io/instance")).and_then(Value::as_str) == Some(release.name.as_str())
             || value.pointer("/metadata/annotations").and_then(|v| v.get("meta.helm.sh/release-name")).and_then(Value::as_str) == Some(release.name.as_str()))
 }
 
 /// Unknown providers still own their ingress ports. Catalogue detection is not an ownership test.
-async fn ingress_conflicts(cluster: &dyn Cluster, observations: &mut Vec<Observation>) -> Result<Vec<String>,ApiError> {
+pub(super) async fn ingress_conflicts(cluster: &dyn Cluster, observations: &mut Vec<Observation>) -> Result<Vec<String>,ApiError> {
     let mut conflicts = Vec::new();
     let services = reference_for("v1","services","Service");
     for value in list(cluster,&services,None).await? {
@@ -129,6 +129,22 @@ async fn ingress_conflicts(cluster: &dyn Cluster, observations: &mut Vec<Observa
         let name = text(&value,"/metadata/name");
         observe(cluster,observations,&classes,"",name).await?;
         conflicts.push(format!("IngressClass {name} already exists. Preserve its traffic owner; ingress migration needs a separate reviewed handoff."));
+    }
+    let pods = reference_for("v1","pods","Pod");
+    for value in list(cluster,&pods,None).await? {
+        if matches!(text(&value,"/status/phase"),"Succeeded" | "Failed") { continue; }
+        let host_network = value.pointer("/spec/hostNetwork").and_then(Value::as_bool) == Some(true);
+        let owns_port = value.pointer("/spec/containers").and_then(Value::as_array).is_some_and(|containers| containers.iter().any(|container| {
+            container.get("ports").and_then(Value::as_array).is_some_and(|ports| ports.iter().any(|port| {
+                matches!(port.get("hostPort").and_then(Value::as_u64),Some(80 | 443))
+                    || (host_network && matches!(port.get("containerPort").and_then(Value::as_u64),Some(80 | 443)))
+            }))
+        }));
+        if owns_port {
+            let ns = text(&value,"/metadata/namespace"); let name = text(&value,"/metadata/name");
+            observe(cluster,observations,&pods,ns,name).await?;
+            conflicts.push(format!("Pod {ns}/{name} owns host ingress ports 80/443. Preserve its traffic owner; ingress migration needs a separate reviewed handoff."));
+        }
     }
     Ok(conflicts)
 }
@@ -176,8 +192,7 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
                     let actual = current.pointer("/metadata/labels").and_then(|l| l.get("pod-security.kubernetes.io/enforce")).and_then(Value::as_str);
                     if actual.is_some_and(|a| a != required && a != "privileged") { out.reasons.push(format!("Namespace {} has incompatible Pod Security enforcement; installation will not edit it.",target.name)); }
                 }
-            } else if matches!(target.kind.as_str(), "HelmChart" | "Secret")
-                && same_install(&current, existing_receipt.as_ref(), component) {
+            } else if same_install(&current, existing_receipt.as_ref(), component) {
                 if target.kind == "HelmChart" { own_charts.push(current); }
             } else {
                 out.state = "external".to_owned();
@@ -202,6 +217,16 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
             if facts.crds.contains(skip) || facts.api_services.contains(skip) || facts.helm_releases.iter().any(|r| r == skip || r.ends_with(&format!("/{skip}"))) {
                 out.reasons.push(format!("Existing resource {skip} conflicts with release {}.",release.name));
             }
+        }
+    }
+    for contribution in &shape.contributions {
+        let chart_ref = reference_for("helm.cattle.io/v1","helmcharts","HelmChart");
+        let chart = observe(cluster,&mut out.observations,&chart_ref,"kube-system",&contribution.release).await?;
+        let record = receipt(&contribution.component);
+        let (record_ref,target) = resource(&record)?;
+        let record = observe(cluster,&mut out.observations,&record_ref,"kube-system",&target.name).await?;
+        if !chart.as_ref().is_some_and(|chart| same_install(chart,record.as_ref(),&contribution.component)) {
+            out.reasons.push(format!("Configuration integration requires dashboard-owned release {}. An absent or external release cannot be modified.",contribution.release));
         }
     }
     let capability = component.split_once('/').map(|(c,_)| c).unwrap_or_default();

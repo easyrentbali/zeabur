@@ -3,6 +3,7 @@
 //! subprocess, service-account escalation, takeover, or automatic rollback is involved.
 
 mod inspect;
+mod phases;
 
 use std::collections::BTreeMap;
 
@@ -55,17 +56,35 @@ pub struct InstallPlan {
     pub profile: String,
     pub writes: Vec<InstallWrite>,
     pub warnings: Vec<String>,
+    pub phases: Vec<InstallPhase>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallPhase {
+    pub index: usize,
+    pub title: String,
+    pub resources: Vec<InstallResource>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InstallApply { pub token: String }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstallResumeRequest { pub component: String }
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct InstallApplied {
     pub component: String,
     pub state: String,
     pub written: Vec<String>,
+    pub continuation_token: Option<String>,
+    pub phase: usize,
+    pub total_phases: usize,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -86,6 +105,10 @@ pub struct Installation {
     pub state: String,
     pub resources: Vec<InstallResource>,
     pub message: String,
+    pub continuation_token: Option<String>,
+    pub phase: usize,
+    pub total_phases: usize,
+    pub resume_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +133,8 @@ struct Claims {
     observations: Vec<Observation>,
     // Sealed authenticated ciphertext, never returned in YAML previews or logged.
     objects: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phased: Option<phases::PhaseClaims>,
 }
 
 fn problem(kind: Kind, detail: impl Into<String>) -> ApiError {
@@ -141,11 +166,11 @@ fn sealing(state: &AppState) -> Result<std::sync::Arc<token::PlanKey>, ApiError>
 fn resource(object: &Value) -> Result<(ResourceRef, ObjectTarget), ApiError> {
     let kind = text(object, "/kind");
     let api = text(object, "/apiVersion");
-    let plural = match (api, kind) {
-        ("v1", "Namespace") => "namespaces", ("v1", "Secret") => "secrets",
-        ("v1", "ConfigMap") => "configmaps", ("helm.cattle.io/v1", "HelmChart") => "helmcharts",
-        _ => return Err(problem(Kind::Invalid, "Unsupported component object.")),
-    };
+    let (plural, namespaced) = native::manifest_resource(api,kind)
+        .ok_or_else(|| problem(Kind::Invalid,"Unsupported component object."))?;
+    if namespaced == text(object,"/metadata/namespace").is_empty() {
+        return Err(problem(Kind::Invalid,"Invalid component object scope."));
+    }
     let (group, version) = api.split_once('/').unwrap_or(("", api));
     Ok((ResourceRef::new(group, version, plural, kind), ObjectTarget {
         api_version: api.to_owned(), kind: kind.to_owned(), plural: plural.to_owned(),
@@ -208,7 +233,9 @@ pub(crate) async fn get(State(state): State<AppState>, Person(cluster): Person, 
         _ if installable => "Ready to preview a create-only installation.",
         _ => "Installation prerequisites must be resolved before applying.",
     }.to_owned();
-    Ok(Json(Installation { component:id, profiles:guide.profiles, inputs:guide.inputs, installable, reasons, state:current, resources, message }))
+    let mut result = Installation { component:id, profiles:guide.profiles, inputs:guide.inputs, installable, reasons, state:current, resources, message, continuation_token:None, phase:0, total_phases:1, resume_available:false };
+    phases::progress(cluster.as_ref(),&state,&mut result).await?;
+    Ok(Json(result))
 }
 
 /// Read-only, identity-bound preview. Sensitive values only enter the encrypted token.
@@ -219,13 +246,19 @@ pub(crate) async fn plan(State(state): State<AppState>, Person(cluster): Person,
     administrator(cluster.as_ref()).await?;
     let key = sealing(&state)?;
     let guide = install::guide(&request.component, &request.profile).map_err(|_| problem(Kind::Invalid, "Unknown component or profile."))?;
-    let rendered = native::render(&request.component, &request.profile, &request.inputs, random).map_err(|e| problem(Kind::Invalid, e))?;
+    let mut generated = Vec::new();
+    let rendered = native::render(&request.component, &request.profile, &request.inputs, |bytes,encoding| {
+        let value = random(bytes,encoding)?; generated.push(value.clone()); Ok(value)
+    }).map_err(|e| problem(Kind::Invalid, e))?;
     let view = inspect::inspect(cluster.as_ref(), &state, &request.component, &guide, &rendered).await?;
     if view.state != "notInstalled" || !view.reasons.is_empty() {
         return Err(problem(Kind::Conflict, format!("Cannot install: {}", view.reasons.join(" "))));
     }
     let identity = cluster.whoami().await.map_err(|_| problem(Kind::Unauthenticated, "Cannot verify your identity."))?;
     let install_id = zeabur_core::crypto::random_token::<16>().map_err(|_| problem(Kind::Internal, "Secure random generation failed."))?;
+    if phases::required(&rendered) {
+        return phases::plan(cluster.as_ref(),&state,request,rendered,view,identity,install_id,generated).await.map(Json);
+    }
     let mut objects = vec![receipt(&request.component)];
     let mut previews = vec![objects[0].clone()];
     for entry in rendered.objects {
@@ -238,9 +271,18 @@ pub(crate) async fn plan(State(state): State<AppState>, Person(cluster): Person,
         after_yaml:serde_saphyr::to_string(object).map_err(|_| problem(Kind::Internal,"Cannot render installation preview."))?,
     })).collect::<Result<Vec<_>,ApiError>>()?;
     let expires_at = (state.clock)().as_second().saturating_add(LIFETIME_SECONDS);
-    let claims = Claims { person:identity.username, groups:identity.groups, component:request.component.clone(), profile:request.profile.clone(), install_id, expires_at, observations:view.observations, objects };
+    let claims = Claims { person:identity.username, groups:identity.groups, component:request.component.clone(), profile:request.profile.clone(), install_id, expires_at, observations:view.observations, objects, phased:None };
     let token = token::sign_as(&key, PREFIX, &claims).map_err(|_| problem(Kind::Internal,"Cannot seal installation plan."))?;
-    Ok(Json(InstallPlan { token, expires_at:Timestamp::from_second(expires_at).unwrap_or(Timestamp::UNIX_EPOCH).to_string(), component:request.component, profile:request.profile, writes, warnings:vec!["Components can hold cluster-wide privileges. Apply creates new resources and never upgrades or deletes an existing release.".to_owned(),"Helm reconciliation is asynchronous. Follow progress until the release and workloads are healthy.".to_owned()] }))
+    Ok(Json(InstallPlan { token, expires_at:Timestamp::from_second(expires_at).unwrap_or(Timestamp::UNIX_EPOCH).to_string(), component:request.component, profile:request.profile, writes, phases:Vec::new(), warnings:vec!["Components can hold cluster-wide privileges. Apply creates new resources and never upgrades or deletes an existing release.".to_owned(),"Helm reconciliation is asynchronous. Follow progress until the release and workloads are healthy.".to_owned()] }))
+}
+
+/// Explicit read-only re-review of remaining phases after the original consent expires.
+#[utoipa::path(post, path = "/api/v1/cluster/components/install/resume-plan", tag = "cluster",
+    operation_id = "planComponentInstallationResume", request_body = InstallResumeRequest,
+    responses((status = 200, body = InstallPlan), (status = 403, body = Problem, content_type = PROBLEM), (status = 409, body = Problem, content_type = PROBLEM)))]
+pub(crate) async fn resume(State(state): State<AppState>,Person(cluster): Person,Json(request): Json<InstallResumeRequest>) -> Result<Json<InstallPlan>,ApiError> {
+    administrator(cluster.as_ref()).await?;
+    phases::resume(cluster.as_ref(),&state,&request.component).await.map(Json)
 }
 
 async fn send(cluster: &dyn Cluster, object: &Value, dry_run: bool) -> Result<(), ApiError> {
@@ -268,6 +310,7 @@ pub(crate) async fn apply(State(state): State<AppState>, Person(cluster): Person
     let claims: Claims = token::open_as(&key,PREFIX,&request.token).map_err(token_problem)?;
     let identity = cluster.whoami().await.map_err(|_| problem(Kind::Unauthenticated,"Cannot verify your identity."))?;
     valid_claims(&claims,&identity.username,&identity.groups,(state.clock)().as_second())?;
+    if claims.phased.is_some() { return phases::apply(cluster.as_ref(),&state,claims).await.map(Json); }
     inspect::unchanged(cluster.as_ref(), &claims.observations).await?;
     // Recheck live conflicts and prerequisites; encrypted objects retain the exact reviewed random values.
     let guide = install::guide(&claims.component,&claims.profile).map_err(|_| problem(Kind::Conflict,"Catalogue changed."))?;
@@ -293,7 +336,7 @@ pub(crate) async fn apply(State(state): State<AppState>, Person(cluster): Person
         }
         written.push(reference(&target));
     }
-    Ok(Json(InstallApplied { component:claims.component, state:"submitted".to_owned(), written }))
+    Ok(Json(InstallApplied { component:claims.component, state:"submitted".to_owned(), written, continuation_token:None, phase:1, total_phases:1, message:"Resources submitted. Controller readiness is still pending.".to_owned() }))
 }
 
 #[cfg(test)]
@@ -304,7 +347,7 @@ mod tests {
         Claims { person: "owner".to_owned(), groups: vec!["admins".to_owned()],
             component: "config-reload/reloader".to_owned(), profile: "multi-node".to_owned(),
             install_id: "fixture".to_owned(), expires_at: 100,
-            observations: Vec::new(), objects: Vec::new() }
+            observations: Vec::new(), objects: Vec::new(), phased:None }
     }
 
     #[test]
