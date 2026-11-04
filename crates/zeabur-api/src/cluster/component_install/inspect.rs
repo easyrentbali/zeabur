@@ -29,8 +29,20 @@ async fn observe(cluster: &dyn Cluster, observations: &mut Vec<Observation>, ref
 
 async fn list(cluster: &dyn Cluster, resource: &ResourceRef, ns: Option<&str>) -> Result<Vec<Value>, ApiError> {
     let objects = cluster.list_objects(resource,ns).await.map_err(|_| problem(Kind::Unavailable,format!("Cannot inspect {} for component conflicts.",resource.resource)))?;
-    objects.unwrap_or_default().into_iter().map(serde_json::to_value).collect::<Result<Vec<_>,_>>()
+    objects.unwrap_or_default().into_iter().map(|object| serde_json::to_value(object).map(|value| list_identity(value,resource))).collect::<Result<Vec<_>,_>>()
         .map_err(|_| problem(Kind::Internal,"Cannot decode component inventory."))
+}
+
+fn list_identity(mut value: Value, resource: &ResourceRef) -> Value {
+    // Kubernetes LIST items may omit TypeMeta; their endpoint still identifies
+    // the kind. Restore only missing fields before health/failure classification.
+    if let Some(object) = value.as_object_mut() {
+        object.entry("kind").or_insert_with(|| json!(resource.kind));
+        object.entry("apiVersion").or_insert_with(|| json!(if resource.group.is_empty() {
+            resource.version.clone()
+        } else { format!("{}/{}",resource.group,resource.version) }));
+    }
+    value
 }
 
 pub(super) async fn unchanged(cluster: &dyn Cluster, expected: &[Observation]) -> Result<(), ApiError> {
@@ -226,6 +238,33 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_install_recognizes_healthy_list_items_without_type_metadata() {
+        let deployment = json!({
+            "metadata":{"name":"reloader","namespace":"reloader","generation":2},
+            "spec":{"replicas":2},
+            "status":{"observedGeneration":2,"availableReplicas":2,"updatedReplicas":2}
+        });
+        assert!(!healthy(&deployment));
+        let current = list_identity(deployment.clone(),&reference_for("apps/v1","deployments","Deployment"));
+        assert!(healthy(&current));
+        assert_eq!(current["metadata"],deployment["metadata"]);
+        let mut stale = current;
+        stale["status"]["observedGeneration"] = json!(1);
+        assert!(!healthy(&stale));
+        let job = list_identity(json!({"status":{"conditions":[
+            {"type":"Complete","status":"True"},
+            {"type":"Failed","status":"True"}
+        ]}}),&reference_for("batch/v1","jobs","Job"));
+        assert!(!failed(&job),"completed jobs retain their terminal success semantics");
+    }
+
+    #[test]
+    fn component_install_preserves_existing_list_item_type_metadata() {
+        let existing = json!({"apiVersion":"apps/v1","kind":"StatefulSet","metadata":{"name":"fixture"}});
+        assert_eq!(list_identity(existing.clone(),&reference_for("apps/v1","deployments","Deployment")),existing);
+    }
 
     #[test]
     fn component_install_progress_accepts_only_secrets_and_charts_from_same_receipt() {
