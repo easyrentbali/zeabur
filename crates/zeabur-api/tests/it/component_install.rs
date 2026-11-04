@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use zeabur_core::problem::KubernetesStatus;
 use zeabur_kube::memory::{MemoryCluster, State};
-use zeabur_kube::{ClusterFacts, Identity, SecretSummary, ServedResource};
+use zeabur_kube::{ClusterFacts, Identity, NamespaceObjects, SecretSummary, ServedResource};
 
 use crate::common::{app, send};
 
@@ -200,7 +200,11 @@ async fn component_install_requires_deployed_release_and_current_healthy_workloa
     let (status, submitted) = apply(&router, &planned).await;
     assert_eq!(status, StatusCode::OK, "{submitted}");
     cluster.update(|state| {
-        let objects = state.objects.get_mut("reloader").unwrap();
+        let objects = state.objects.entry("reloader".to_owned())
+            .or_insert_with(|| NamespaceObjects {
+                namespace: "reloader".to_owned(),
+                ..NamespaceObjects::default()
+            });
         objects.secrets.push(SecretSummary {
             secret: serde_json::from_value(json!({"metadata": {
                 "name": "sh.helm.release.v1.reloader.v1", "namespace": "reloader",
