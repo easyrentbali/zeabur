@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use zeabur_core::problem::KubernetesStatus;
 use zeabur_kube::memory::{MemoryCluster, State};
-use zeabur_kube::{ClusterFacts, Identity, NamespaceObjects, SecretSummary, ServedResource};
+use zeabur_kube::{Cluster as _, ClusterFacts, Identity, NamespaceObjects, SecretSummary, ServedResource};
 
 use crate::common::{app, send};
 
@@ -33,6 +33,14 @@ fn cluster() -> MemoryCluster {
         served: vec![
             ServedResource::readable("apiextensions.k8s.io", "v1", "customresourcedefinitions", "CustomResourceDefinition", false),
             ServedResource::readable("helm.cattle.io", "v1", "helmcharts", "HelmChart", true),
+            // MemoryCluster's typed built-ins do not include these real API
+            // resources. SUC's direct controller phase must read them back
+            // through discovery after creation, just as kube-apiserver does.
+            ServedResource::readable("", "v1", "serviceaccounts", "ServiceAccount", true),
+            ServedResource::readable("rbac.authorization.k8s.io", "v1", "roles", "Role", true),
+            ServedResource::readable("rbac.authorization.k8s.io", "v1", "rolebindings", "RoleBinding", true),
+            ServedResource::readable("rbac.authorization.k8s.io", "v1", "clusterroles", "ClusterRole", false),
+            ServedResource::readable("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "ClusterRoleBinding", false),
         ],
         dynamic: vec![serde_json::from_value(json!({
             "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
@@ -56,6 +64,26 @@ async fn apply(router: &Router, planned: &Value) -> (StatusCode, Value) {
 
 fn writes(cluster: &MemoryCluster) -> usize {
     cluster.inspect(|state| state.writes.len()).unwrap()
+}
+
+#[tokio::test]
+async fn component_install_fixture_serves_every_reviewed_system_upgrade_resource() {
+    let cluster = cluster();
+    let served = cluster.served_resources().await.unwrap();
+    let shape = zeabur_catalog::install::native::describe(
+        "node-updates/system-upgrade-controller", "single-node"
+    ).unwrap();
+    for entry in shape.objects {
+        let api = entry.object["apiVersion"].as_str().unwrap();
+        let kind = entry.object["kind"].as_str().unwrap();
+        let (plural, namespaced) = zeabur_catalog::install::native::manifest_resource(api, kind).unwrap();
+        assert!(served.iter().any(|resource| {
+            let reference = resource.as_ref();
+            reference.api_version() == api && reference.kind == kind
+                && reference.resource == plural && resource.namespaced == namespaced
+        }), "fixture discovery must serve reviewed {api}/{kind}");
+    }
+    assert_eq!(writes(&cluster), 0);
 }
 
 #[tokio::test]
