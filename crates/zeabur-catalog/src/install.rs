@@ -46,6 +46,8 @@
 //! [rke2-packaged]: https://docs.rke2.io/advanced
 //! [rke2-ingress]: https://docs.rke2.io/networking/networking_services
 
+pub mod native;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;

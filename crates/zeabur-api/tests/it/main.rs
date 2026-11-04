@@ -8,6 +8,7 @@ mod backups;
 mod certificates;
 mod cluster_name;
 mod cluster_tools;
+mod component_install;
 #[cfg(test)]
 #[path = "../common/mod.rs"]
 mod common;
