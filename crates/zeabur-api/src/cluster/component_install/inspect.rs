@@ -346,7 +346,7 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
                 text(&entry.object, "/metadata/name") == skip
                     && out.satisfied.iter().any(|key| key == &object_key(&entry.object))
             });
-            if !satisfied && (facts.crds.contains(skip) || facts.api_services.contains(skip) || facts.helm_releases.iter().any(|r| r == skip || r.ends_with(&format!("/{skip}"))) {
+            if !satisfied && (facts.crds.contains(skip) || facts.api_services.contains(skip) || facts.helm_releases.iter().any(|r| r == skip || r.ends_with(&format!("/{skip}")))) {
                 out.reasons.push(format!("Existing resource {skip} conflicts with release {}.",release.name));
             }
         }
