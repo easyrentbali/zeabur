@@ -13,6 +13,8 @@ pub(super) struct PhaseClaims {
     digest: String,
     phase: usize,
     skip_namespaces: Vec<String>,
+    #[serde(default)]
+    satisfied: Vec<String>,
     created: Vec<Observation>,
     admitted: BTreeMap<String,String>,
     markers: Vec<Observation>,
@@ -98,7 +100,8 @@ fn phase_total(shape: &native::NativeInstall, claims: &PhaseClaims) -> usize {
 }
 
 fn skip(object: &Value, phase: &PhaseClaims) -> bool {
-    text(object,"/kind") == "Namespace" && phase.skip_namespaces.iter().any(|n| n == text(object,"/metadata/name"))
+    (text(object,"/kind") == "Namespace" && phase.skip_namespaces.iter().any(|n| n == text(object,"/metadata/name")))
+        || phase.satisfied.iter().any(|key| key == &inspect::object_key(object))
 }
 
 fn reference_of(object: &Value) -> Result<InstallResource,ApiError> {
@@ -149,7 +152,7 @@ pub(super) async fn plan(cluster: &dyn Cluster,state: &AppState,request: Install
     let guide = install::guide(&request.component,&request.profile).map_err(|_| problem(Kind::Conflict,"The installation catalogue changed."))?;
     let integrations = contributions(cluster,&shape,&guide).await?;
     let phases = shape.phases.iter().enumerate().map(|(index,phase)| {
-        Ok(InstallPhase { index,title:phase.name.clone(),resources:phase.objects.iter().filter_map(|i| shape.objects.get(*i)).map(|o| reference_of(&o.object)).collect::<Result<Vec<_>,ApiError>>()? })
+        Ok(InstallPhase { index,title:phase.name.clone(),resources:phase.objects.iter().filter_map(|i| shape.objects.get(*i)).filter(|o| !view.satisfied.iter().any(|key| key == &inspect::object_key(&o.object))).map(|o| reference_of(&o.object)).collect::<Result<Vec<_>,ApiError>>()? })
     }).collect::<Result<Vec<_>,ApiError>>()?;
     let mut writes = Vec::new();
     for entry in &shape.objects {
@@ -169,7 +172,7 @@ pub(super) async fn plan(cluster: &dyn Cluster,state: &AppState,request: Install
         }
     }
     let expires_at = (state.clock)().as_second().saturating_add(LIFETIME_SECONDS);
-    let compact = PhaseClaims { inputs:request.inputs,generated,digest:digest(&shape)?,phase:0,skip_namespaces:view.existing_namespaces,created:Vec::new(),admitted:BTreeMap::new(),markers:Vec::new(),contributions:integrations };
+    let compact = PhaseClaims { inputs:request.inputs,generated,digest:digest(&shape)?,phase:0,skip_namespaces:view.existing_namespaces,satisfied:view.satisfied.clone(),created:Vec::new(),admitted:BTreeMap::new(),markers:Vec::new(),contributions:integrations };
     let claims = Claims { person:identity.username,groups:identity.groups,component:request.component.clone(),profile:request.profile.clone(),install_id,expires_at,observations:view.observations,objects:Vec::new(),phased:Some(compact) };
     let token = seal(state,&claims)?;
     Ok(InstallPlan { token,expires_at:Timestamp::from_second(expires_at).unwrap_or(Timestamp::UNIX_EPOCH).to_string(),component:request.component,profile:request.profile,writes,phases,
@@ -369,7 +372,7 @@ pub(super) async fn apply(cluster: &dyn Cluster,state: &AppState,mut claims: Cla
     if index == 0 {
         let guide = install::guide(&claims.component,&claims.profile).map_err(|_| problem(Kind::Conflict,"Catalogue changed."))?;
         let view = inspect::inspect(cluster,state,&claims.component,&guide,&shape).await?;
-        if view.state != "notInstalled" || !view.reasons.is_empty() { return Err(problem(Kind::Conflict,format!("Installation changed: {}",view.reasons.join(" ")))); }
+        if view.state != "notInstalled" || inspect::has_blocking_reasons(&view.reasons) { return Err(problem(Kind::Conflict,format!("Installation changed: {}",view.reasons.join(" ")))); }
     }
     let entries: Vec<_> = shape.phases.get(index).map(|phase| phase.objects.iter().filter_map(|i| shape.objects.get(*i)).filter(|o| !skip(&o.object,compact)).map(|o| o.object.clone()).collect()).unwrap_or_default();
     let new_namespaces: Vec<_> = entries.iter().filter(|o| text(o,"/kind") == "Namespace").map(|o| text(o,"/metadata/name").to_owned()).collect();

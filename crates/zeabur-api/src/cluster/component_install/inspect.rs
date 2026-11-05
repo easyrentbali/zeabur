@@ -7,6 +7,7 @@ pub(super) struct Inspection {
     pub reasons: Vec<String>,
     pub observations: Vec<Observation>,
     pub existing_namespaces: Vec<String>,
+    pub satisfied: Vec<String>,
 }
 
 pub(super) fn reference_for(api: &str, plural: &str, kind: &str) -> ResourceRef {
@@ -15,6 +16,87 @@ pub(super) fn reference_for(api: &str, plural: &str, kind: &str) -> ResourceRef 
 }
 
 fn namespace(value: &str) -> Option<&str> { (!value.is_empty()).then_some(value) }
+
+pub(super) fn object_key(value: &Value) -> String {
+    format!("{}/{}/{}", text(value, "/kind"), text(value, "/metadata/namespace"), text(value, "/metadata/name"))
+}
+
+fn subset(expected: &Value, current: &Value) -> bool {
+    match (expected, current) {
+        (Value::Object(expected), Value::Object(current)) => expected
+            .iter()
+            .all(|(key, value)| current.get(key).is_some_and(|candidate| subset(value, candidate))),
+        (Value::Array(expected), Value::Array(current)) => expected.len() == current.len()
+            && expected.iter().zip(current).all(|(left, right)| subset(left, right)),
+        _ => expected == current,
+    }
+}
+
+fn compatible_crd(expected: &Value, current: &Value) -> bool {
+    let Some(expected_spec) = expected.pointer("/spec") else { return false; };
+    let Some(current_spec) = current.pointer("/spec") else { return false; };
+    for field in ["group", "scope"] {
+        if expected_spec.pointer(&format!("/{field}")) != current_spec.pointer(&format!("/{field}")) {
+            return false;
+        }
+    }
+    for field in ["kind", "plural", "singular"] {
+        if expected_spec.pointer(&format!("/names/{field}")) != current_spec.pointer(&format!("/names/{field}")) {
+            return false;
+        }
+    }
+    let Some(expected_versions) = expected_spec.pointer("/versions").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(current_versions) = current_spec.pointer("/versions").and_then(Value::as_array) else {
+        return false;
+    };
+    if current_versions.len() != expected_versions.len() {
+        return false;
+    }
+    expected_versions.iter().all(|expected_version| {
+        let name = text(expected_version, "/name");
+        let Some(current_version) = current_versions.iter().find(|version| text(version, "/name") == name) else {
+            return false;
+        };
+        if expected_version.pointer("/schema") != current_version.pointer("/schema") {
+            return false;
+        }
+        (!expected_version.pointer("/served").and_then(Value::as_bool).unwrap_or(false)
+            || current_version.pointer("/served").and_then(Value::as_bool) == Some(true))
+            && (!expected_version.pointer("/storage").and_then(Value::as_bool).unwrap_or(false)
+                || current_version.pointer("/storage").and_then(Value::as_bool) == Some(true))
+    })
+}
+
+fn compatible_skipped(expected: &Value, current: &Value, release: &native::NativeRelease) -> bool {
+    let name = text(expected, "/metadata/name");
+    if !release.skip_if_present.iter().any(|entry| entry == name) {
+        return false;
+    }
+    if text(expected, "/apiVersion") != text(current, "/apiVersion")
+        || text(expected, "/kind") != text(current, "/kind")
+        || name != text(current, "/metadata/name")
+    {
+        return false;
+    }
+    match text(expected, "/kind") {
+        "CustomResourceDefinition" => compatible_crd(expected, current),
+        // Admission policies are shared cluster contracts. Preserve an existing policy
+        // only when every reviewed field is still present; extra server defaults are fine.
+        "ValidatingAdmissionPolicy" | "ValidatingAdmissionPolicyBinding" =>
+            expected.pointer("/spec").zip(current.pointer("/spec")).is_some_and(|(left, right)| subset(left, right)),
+        _ => false,
+    }
+}
+
+pub(super) fn satisfied_resource(expected: &Value, current: &Value, release: &native::NativeRelease) -> bool {
+    compatible_skipped(expected, current, release)
+}
+
+pub(super) fn has_blocking_reasons(reasons: &[String]) -> bool {
+    reasons.iter().any(|reason| !reason.starts_with("Preserved existing "))
+}
 
 pub(super) async fn observe(cluster: &dyn Cluster, observations: &mut Vec<Observation>, reference: &ResourceRef, ns: &str, name: &str) -> Result<Option<Value>, ApiError> {
     let object = cluster.find_object(reference, namespace(ns), name).await
@@ -121,14 +203,14 @@ pub(super) async fn ingress_conflicts(cluster: &dyn Cluster, observations: &mut 
         if port_owner {
             let ns = text(&value,"/metadata/namespace"); let name = text(&value,"/metadata/name");
             observe(cluster,observations,&services,ns,name).await?;
-            conflicts.push(format!("Service {ns}/{name} already owns public ingress ports; dashboard installation cannot replace it."));
+            conflicts.push(format!("Service {ns}/{name} already owns public ingress ports; migrate traffic through a separate reviewed handoff before installation."));
         }
     }
     let classes = reference_for("networking.k8s.io/v1","ingressclasses","IngressClass");
     for value in list(cluster,&classes,None).await? {
         let name = text(&value,"/metadata/name");
         observe(cluster,observations,&classes,"",name).await?;
-        conflicts.push(format!("IngressClass {name} already exists. Preserve its traffic owner; ingress migration needs a separate reviewed handoff."));
+            conflicts.push(format!("IngressClass {name} already exists. Preserve its traffic owner; migrate it through a separate reviewed handoff before installation."));
     }
     let pods = reference_for("v1","pods","Pod");
     for value in list(cluster,&pods,None).await? {
@@ -143,14 +225,14 @@ pub(super) async fn ingress_conflicts(cluster: &dyn Cluster, observations: &mut 
         if owns_port {
             let ns = text(&value,"/metadata/namespace"); let name = text(&value,"/metadata/name");
             observe(cluster,observations,&pods,ns,name).await?;
-            conflicts.push(format!("Pod {ns}/{name} owns host ingress ports 80/443. Preserve its traffic owner; ingress migration needs a separate reviewed handoff."));
+            conflicts.push(format!("Pod {ns}/{name} owns host ingress ports 80/443. Preserve its traffic owner; migrate traffic through a separate reviewed handoff before installation."));
         }
     }
     Ok(conflicts)
 }
 
 pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: &str, guide: &install::InstallGuide, shape: &native::NativeInstall) -> Result<Inspection,ApiError> {
-    let mut out = Inspection { state:"notInstalled".to_owned(), reasons:Vec::new(), observations:Vec::new(), existing_namespaces:Vec::new() };
+    let mut out = Inspection { state:"notInstalled".to_owned(), reasons:Vec::new(), observations:Vec::new(), existing_namespaces:Vec::new(), satisfied:Vec::new() };
     let facts = cluster.cluster_facts().await.map_err(|_| problem(Kind::Unavailable,"Cannot verify cluster component inventory."))?;
     if !facts.unreadable.is_empty() { out.reasons.push("The component inventory is incomplete; cluster-wide read permissions are required.".to_owned()); }
     if !matches!(zeabur_catalog::distribution(&facts),Some("k3s" | "rke2")) { out.reasons.push("Dashboard installs require an existing K3s/RKE2 Helm controller.".to_owned()); }
@@ -188,10 +270,22 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
         if let Some(current) = current {
             if target.kind == "Namespace" {
                 out.existing_namespaces.push(target.name.clone());
+                let mut incompatible_security = false;
                 if let Some(required) = &shape.pod_security {
                     let actual = current.pointer("/metadata/labels").and_then(|l| l.get("pod-security.kubernetes.io/enforce")).and_then(Value::as_str);
-                    if actual.is_some_and(|a| a != required && a != "privileged") { out.reasons.push(format!("Namespace {} has incompatible Pod Security enforcement; installation will not edit it.",target.name)); }
+                    incompatible_security = actual.is_some_and(|a| a != required && a != "privileged");
+                    if incompatible_security { out.reasons.push(format!("Namespace {} has incompatible Pod Security enforcement; installation will not edit it.",target.name)); }
                 }
+                if !incompatible_security {
+                    out.satisfied.push(object_key(&entry.object));
+                }
+            } else if let Some(release) = shape.releases.iter().find(|release| release.skip_if_present.iter().any(|name| name == &target.name)) {
+                if satisfied_resource(&entry.object, &current, release) {
+                    out.satisfied.push(object_key(&entry.object));
+                    continue;
+                }
+                out.state = "external".to_owned();
+                out.reasons.push(format!("{} {} exists but its reviewed schema/version is incompatible; migrate it before installation.", target.kind, target.name));
             } else if same_install(&current, existing_receipt.as_ref(), component) {
                 if target.kind == "HelmChart" { own_charts.push(current); }
             } else {
@@ -214,7 +308,11 @@ pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: 
             release_states.push(status);
         }
         for skip in &release.skip_if_present {
-            if facts.crds.contains(skip) || facts.api_services.contains(skip) || facts.helm_releases.iter().any(|r| r == skip || r.ends_with(&format!("/{skip}"))) {
+            let satisfied = shape.objects.iter().any(|entry| {
+                text(&entry.object, "/metadata/name") == skip
+                    && out.satisfied.iter().any(|key| key == &object_key(&entry.object))
+            });
+            if !satisfied && (facts.crds.contains(skip) || facts.api_services.contains(skip) || facts.helm_releases.iter().any(|r| r == skip || r.ends_with(&format!("/{skip}"))) {
                 out.reasons.push(format!("Existing resource {skip} conflicts with release {}.",release.name));
             }
         }
@@ -328,5 +426,29 @@ mod tests {
         assert!(failed(&job));
         job["status"]["conditions"] = json!([{"type": "Complete", "status": "True"}]);
         assert!(!failed(&job));
+    }
+
+    #[test]
+    fn compatible_skip_if_present_resources_are_satisfied_only_on_exact_spec() {
+        let release = native::NativeRelease { name: "gateway".to_owned(), namespace: "kube-system".to_owned(), skip_if_present: vec!["gateways.gateway.networking.k8s.io".to_owned()] };
+        let expected = json!({"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gateways.gateway.networking.k8s.io"},"spec":{"group":"gateway.networking.k8s.io","scope":"Namespaced","names":{"plural":"gateways"},"versions":[{"name":"v1","served":true,"storage":true}]}});
+        assert!(satisfied_resource(&expected, &expected, &release));
+        let mut incompatible = expected.clone(); incompatible["spec"]["versions"][0]["name"] = json!("v1beta1");
+        assert!(!satisfied_resource(&expected, &incompatible, &release));
+        let mut schema_changed = expected.clone(); schema_changed["spec"]["versions"][0]["schema"] = json!({"openAPIV3Schema":{"type":"object"}});
+        assert!(!satisfied_resource(&expected, &schema_changed, &release));
+    }
+
+    #[test]
+    fn skip_names_are_not_a_generic_takeover_escape() {
+        let release = native::NativeRelease { name: "gateway".to_owned(), namespace: "kube-system".to_owned(), skip_if_present: vec!["public".to_owned()] };
+        let service = json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"public"},"spec":{}});
+        assert!(!satisfied_resource(&service, &service, &release));
+    }
+
+    #[test]
+    fn preserved_resources_are_informational_but_external_resources_block() {
+        assert!(!has_blocking_reasons(&["Preserved existing Namespace kube-system (already present).".to_owned()]));
+        assert!(has_blocking_reasons(&["Service kube-system/public already owns public ingress ports; migrate it first.".to_owned()]));
     }
 }

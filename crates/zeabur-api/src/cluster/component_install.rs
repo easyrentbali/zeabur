@@ -224,7 +224,7 @@ pub(crate) async fn get(State(state): State<AppState>, Person(cluster): Person, 
             reasons.extend(view.reasons);
         }
     }
-    let installable = reasons.is_empty() && current == "notInstalled";
+    let installable = !inspect::has_blocking_reasons(&reasons) && current == "notInstalled";
     let message = match current.as_str() {
         "installed" => "The Helm release is deployed and its workloads are healthy.",
         "pending" => "Installation is in progress. Submission is not readiness.",
@@ -251,7 +251,7 @@ pub(crate) async fn plan(State(state): State<AppState>, Person(cluster): Person,
         let value = random(bytes,encoding)?; generated.push(value.clone()); Ok(value)
     }).map_err(|e| problem(Kind::Invalid, e))?;
     let view = inspect::inspect(cluster.as_ref(), &state, &request.component, &guide, &rendered).await?;
-    if view.state != "notInstalled" || !view.reasons.is_empty() {
+    if view.state != "notInstalled" || inspect::has_blocking_reasons(&view.reasons) {
         return Err(problem(Kind::Conflict, format!("Cannot install: {}", view.reasons.join(" "))));
     }
     let identity = cluster.whoami().await.map_err(|_| problem(Kind::Unauthenticated, "Cannot verify your identity."))?;
@@ -262,7 +262,7 @@ pub(crate) async fn plan(State(state): State<AppState>, Person(cluster): Person,
     let mut objects = vec![receipt(&request.component)];
     let mut previews = vec![objects[0].clone()];
     for entry in rendered.objects {
-        if text(&entry.object, "/kind") == "Namespace" && view.existing_namespaces.contains(&text(&entry.object,"/metadata/name").to_owned()) { continue; }
+        if view.satisfied.iter().any(|key| key == &inspect::object_key(&entry.object)) { continue; }
         objects.push(entry.object); previews.push(entry.preview);
     }
     for object in objects.iter_mut().chain(previews.iter_mut()) { mark(object, &request.component, &install_id); }
@@ -316,7 +316,7 @@ pub(crate) async fn apply(State(state): State<AppState>, Person(cluster): Person
     let guide = install::guide(&claims.component,&claims.profile).map_err(|_| problem(Kind::Conflict,"Catalogue changed."))?;
     let shape = native::describe(&claims.component,&claims.profile).map_err(|e| problem(Kind::Conflict,e))?;
     let view = inspect::inspect(cluster.as_ref(),&state,&claims.component,&guide,&shape).await?;
-    if view.state != "notInstalled" || !view.reasons.is_empty() { return Err(problem(Kind::Conflict,format!("Installation changed: {}",view.reasons.join(" ")))); }
+    if view.state != "notInstalled" || inspect::has_blocking_reasons(&view.reasons) { return Err(problem(Kind::Conflict,format!("Installation changed: {}",view.reasons.join(" ")))); }
     let new_namespaces: Vec<&str> = claims.objects.iter().filter(|o| text(o,"/kind") == "Namespace").map(|o| text(o,"/metadata/name")).collect();
     for object in &claims.objects {
         if !new_namespaces.contains(&text(object,"/metadata/namespace")) { send(cluster.as_ref(),object,true).await?; }
