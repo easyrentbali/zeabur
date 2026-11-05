@@ -1,0 +1,48 @@
+name: ERB API schema
+
+# Generation only: no image publication, production credentials or deployments.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: erb-api-schema-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zeabur-oss/.github/actions/ci-setup@64a6547509a1911f03c4b1e62965ef9f2b4c39b6
+        with:
+          rust-cache: true
+      - name: Install locked web dependencies
+        run: nix develop -c bash -c 'cd web && bun ci'
+      - name: Generate API and client from Rust handlers
+        run: nix develop -c cargo xtask openapi
+      - name: Test API, Kubernetes adapter and catalog
+        run: nix develop -c cargo nextest run --locked -p zeabur-api -p zeabur-kube -p zeabur-catalog
+      - name: Check generated client and focused UI behavior
+        run: |
+          nix develop -c bash -c 'cd web && bun run typecheck && bun test src/routes/cluster/components.test.ts src/model/component-install.test.ts'
+          git diff --check
+      - name: Record exact source and artifact checksums
+        run: |
+          git rev-parse HEAD > SOURCE_COMMIT
+          sha256sum crates/zeabur-api/openapi.yaml web/src/api/zeabur.ts > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: erb-api-schema
+          path: |
+            SOURCE_COMMIT
+            SHA256SUMS
+            crates/zeabur-api/openapi.yaml
+            web/src/api/zeabur.ts
+          if-no-files-found: error
+          retention-days: 7
