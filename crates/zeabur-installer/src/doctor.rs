@@ -86,6 +86,7 @@ pub(crate) fn run() -> ExitCode {
                         .filter(|c| c.status != Status::Pass)
                         .map(|c| (c.status, c.detail)),
                 );
+                results.extend(longhorn_nodes(&kubectl));
             }
             if plan.get("zeabur").is_some_and(|z| !z.is_null()) {
                 results.push(deployment(&kubectl, IDENTITY_NAMESPACE, "zeabur-identity"));
@@ -207,17 +208,22 @@ const fn rank(status: Status) -> u8 {
     }
 }
 
-/// The line for a component whose checks pass, marked when the catalog did not test it here.
-fn passed(id: &str, component: &Value) -> String {
-    if component.get("untested") == Some(&Value::Bool(true)) {
-        format!("{id} (untested)")
-    } else {
-        id.to_owned()
+/// The line for a component whose checks pass. It names only what was checked: its workloads are
+/// reported under their namespace, so they may still be unavailable.
+fn passed(id: &str, component: &Value, checks: &[Health]) -> String {
+    let mut line = format!("{id}: charts installed");
+    if !checks.is_empty() {
+        line.push_str(", health checks pass");
     }
+    if component.get("untested") == Some(&Value::Bool(true)) {
+        line.push_str(" (untested)");
+    }
+    line
 }
 
-/// Each component's `HelmCharts` installed, its Deployments and `DaemonSets` available and the
-/// catalog's health checks in the install record met.
+/// Each component's `HelmCharts` installed and the catalog's health checks in the install record
+/// met, then the Deployments and `DaemonSets` of every component namespace available. Components
+/// share namespaces, so a workload is reported once under its namespace, not under a component.
 pub(crate) fn components(kubectl: &Kubectl, plan: &Value) -> Vec<(Status, String)> {
     let mut results = Vec::new();
     for component in plan
@@ -231,23 +237,12 @@ pub(crate) fn components(kubectl: &Kubectl, plan: &Value) -> Vec<(Status, String
             .and_then(Value::as_str)
             .unwrap_or_default();
         let mut problems = Vec::new();
-        let mut namespaces: Vec<&str> = Vec::new();
         for release in component
             .get("releases")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            let namespace = release
-                .get("namespace")
-                .or_else(|| release.pointer("/object/spec/targetNamespace"))
-                .and_then(Value::as_str);
-            if let Some(ns) = namespace
-                && ns != "kube-system"
-                && !namespaces.contains(&ns)
-            {
-                namespaces.push(ns);
-            }
             if release.get("kind").and_then(Value::as_str) != Some("helmChart") {
                 continue;
             }
@@ -266,28 +261,6 @@ pub(crate) fn components(kubectl: &Kubectl, plan: &Value) -> Vec<(Status, String
                 problems.push(format!("chart {name} is not installed (kubectl logs -n kube-system job/helm-install-{name})"));
             }
         }
-        for ns in namespaces {
-            match kubectl.run(
-                &[
-                    "get",
-                    "deployments,daemonsets",
-                    "--namespace",
-                    ns,
-                    "--output=json",
-                ],
-                None,
-            ) {
-                Ok(out) => {
-                    let list = serde_json::from_str::<Value>(&out).unwrap_or_default();
-                    problems.extend(
-                        unavailable(&list)
-                            .into_iter()
-                            .map(|w| format!("{ns}: {w} (kubectl get pods -n {ns})")),
-                    );
-                }
-                Err(e) => problems.push(format!("reading workloads in {ns}: {e}")),
-            }
-        }
         let checks = component
             .get("health")
             .and_then(|h| serde_json::from_value::<Vec<Health>>(h.clone()).ok());
@@ -300,11 +273,14 @@ pub(crate) fn components(kubectl: &Kubectl, plan: &Value) -> Vec<(Status, String
                 ),
             ));
         }
-        let failed = failed_health(checks.as_deref().unwrap_or_default(), |args| {
-            kubectl.wait(args).is_ok()
+        let failed = failed_health(checks.as_deref().unwrap_or_default(), |check, timeout| {
+            wait_health(check, timeout, |args| kubectl.wait(args)).is_ok()
         });
         if checks.is_some() && problems.is_empty() && failed.is_empty() {
-            results.push((Status::Pass, passed(id, component)));
+            results.push((
+                Status::Pass,
+                passed(id, component, checks.as_deref().unwrap_or_default()),
+            ));
         }
         if !problems.is_empty() {
             results.push((Status::Fail, format!("{id}: {}", problems.join("; "))));
@@ -315,17 +291,69 @@ pub(crate) fn components(kubectl: &Kubectl, plan: &Value) -> Vec<(Status, String
                 .map(|failure| (Status::Fail, format!("{id}: {failure}"))),
         );
     }
+    for ns in namespaces(plan) {
+        let args = [
+            "get",
+            "deployments,daemonsets",
+            "--namespace",
+            ns,
+            "--output=json",
+        ];
+        match kubectl.run(&args, None) {
+            Ok(out) => {
+                let list = serde_json::from_str::<Value>(&out).unwrap_or_default();
+                for workload in unavailable(&list) {
+                    results.push((
+                        Status::Fail,
+                        format!("{ns}: {workload} (kubectl get pods -n {ns})"),
+                    ));
+                }
+            }
+            Err(e) => results.push((Status::Fail, format!("reading workloads in {ns}: {e}"))),
+        }
+    }
     results
 }
 
+/// The namespaces the components' releases install into, each once. `kube-system` is left out:
+/// K3s runs its own workloads there.
+fn namespaces(plan: &Value) -> Vec<&str> {
+    let mut found = Vec::new();
+    for component in plan
+        .get("components")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for release in component
+            .get("releases")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let namespace = release
+                .get("namespace")
+                .or_else(|| release.pointer("/object/spec/targetNamespace"))
+                .and_then(Value::as_str);
+            if let Some(ns) = namespace
+                && ns != "kube-system"
+                && !found.contains(&ns)
+            {
+                found.push(ns);
+            }
+        }
+    }
+    found
+}
+
 /// The catalog's health checks that fail, each with its advice and the wait that failed.
-fn failed_health(checks: &[Health], wait: impl Fn(&[&str]) -> bool) -> Vec<String> {
+fn failed_health(checks: &[Health], wait: impl Fn(&Health, &str) -> bool) -> Vec<String> {
     checks
         .iter()
         .filter_map(|check| {
             let timeout = format!("--timeout={}", check.timeout);
             let args = check.args(&timeout);
-            (!wait(&args)).then(|| {
+            (!wait(check, &timeout)).then(|| {
                 format!(
                     "{}: {} To check again: kubectl wait {}",
                     check.name,
@@ -337,8 +365,18 @@ fn failed_health(checks: &[Health], wait: impl Fn(&[&str]) -> bool) -> Vec<Strin
         .collect()
 }
 
-/// The Deployments and `DaemonSets` in a list that have fewer Pods available than they want, as
-/// text.
+/// Runs a health check: waits for its objects to exist, then for its condition.
+pub(crate) fn wait_health<E>(
+    check: &Health,
+    timeout: &str,
+    mut wait: impl FnMut(&[&str]) -> Result<(), E>,
+) -> Result<(), E> {
+    wait(&check.create_args(timeout))?;
+    wait(&check.args(timeout))
+}
+
+/// The Deployments and `DaemonSets` in a list that have fewer Pods available than they want, or
+/// a Deployment scaled to 0, as text.
 fn unavailable(list: &Value) -> Vec<String> {
     let mut found = Vec::new();
     for item in list
@@ -364,10 +402,83 @@ fn unavailable(list: &Value) -> Vec<String> {
                 count("/status/availableReplicas").unwrap_or(0),
             )
         };
-        if have < want {
+        if kind != "DaemonSet" && want == 0 {
+            found.push(format!("deployment/{name} is scaled to 0"));
+        } else if have < want {
             found.push(format!(
                 "{}/{name} has {have} of {want} Pods available",
                 kind.to_ascii_lowercase()
+            ));
+        }
+    }
+    found
+}
+
+/// The nodes whose Longhorn checks of iSCSI, NFS or kernel modules fail, as Longhorn's Node
+/// objects report them.
+fn longhorn_nodes(kubectl: &Kubectl) -> Vec<(Status, String)> {
+    let list = kubectl
+        .run(
+            &[
+                "get",
+                "nodes.longhorn.io",
+                "-n",
+                "longhorn-system",
+                "--output=json",
+            ],
+            None,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|out| serde_json::from_str::<Value>(&out).map_err(|e| e.to_string()));
+    match list {
+        Ok(list) => unprepared_nodes(&list)
+            .into_iter()
+            .map(|n| (Status::Fail, n))
+            .collect(),
+        Err(e) => vec![(Status::Warn, format!("reading Longhorn's nodes: {e}"))],
+    }
+}
+
+/// Longhorn's node conditions that a node's preparation makes true.
+const LONGHORN_PREP_CONDITIONS: [&str; 3] = [
+    "RequiredPackages",
+    "KernelModulesLoaded",
+    "NFSClientInstalled",
+];
+
+/// The Longhorn Node objects in a list with a preparation condition that is not true, as text.
+fn unprepared_nodes(list: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    for node in list
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = node
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let failing: Vec<&str> = node
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|c| {
+                c.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| LONGHORN_PREP_CONDITIONS.contains(&t))
+                    && c.get("status").and_then(Value::as_str) == Some("False")
+            })
+            .map(|c| c.get("message").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        if !failing.is_empty() {
+            found.push(format!(
+                "node {name} is not prepared for Longhorn ({}): run zeabur-installer apply on it, \
+                 then restart its Longhorn manager, which only checks the node again when it \
+                 starts: kubectl -n longhorn-system delete pod -l app=longhorn-manager \
+                 --field-selector spec.nodeName={name}",
+                failing.join("; ")
             ));
         }
     }
@@ -525,8 +636,134 @@ mod tests {
             unavailable(&list),
             [
                 "deployment/moco-controller has 0 of 2 Pods available",
+                "deployment/off is scaled to 0",
                 "daemonset/agent has 2 of 3 Pods available"
             ]
+        );
+    }
+
+    #[test]
+    fn a_passing_component_names_only_what_was_checked() {
+        let check = Health {
+            name: "nodes-ready".to_owned(),
+            wait: Vec::new(),
+            timeout: "60s".to_owned(),
+            advice: String::new(),
+        };
+        assert_eq!(
+            passed("metrics/victoria-metrics", &json!({}), &[]),
+            "metrics/victoria-metrics: charts installed"
+        );
+        assert_eq!(
+            passed(
+                "replicated-storage/longhorn",
+                &json!({"untested": true}),
+                &[check]
+            ),
+            "replicated-storage/longhorn: charts installed, health checks pass (untested)"
+        );
+    }
+
+    #[test]
+    fn a_namespace_shared_by_components_has_its_workloads_read_once() {
+        let plan = json!({"components": [
+            {"id": "metrics/victoria-metrics", "releases": [
+                {"kind": "helmChart", "name": "vm", "namespace": "observability"},
+            ]},
+            {"id": "logs/victoria-logs", "releases": [
+                {"kind": "helmChart", "name": "vl", "namespace": "observability"},
+                {"kind": "manifest", "object": {"spec": {"targetNamespace": "logs-extra"}}},
+            ]},
+            {"id": "ingress/traefik", "releases": [
+                {"kind": "helmChart", "name": "traefik", "namespace": "kube-system"},
+            ]},
+        ]});
+        assert_eq!(namespaces(&plan), ["observability", "logs-extra"]);
+    }
+
+    #[test]
+    fn a_longhorn_node_without_its_packages_is_named_with_longhorns_message() {
+        let node = |name: &str, conditions: Value| json!({"metadata": {"name": name}, "status": {"conditions": conditions}});
+        let list = json!({"items": [
+            node("vps-1", json!([
+                {"type": "Ready", "status": "True"},
+                {"type": "RequiredPackages", "status": "True"},
+                {"type": "NFSClientInstalled", "status": "True"},
+            ])),
+            node("vps-2", json!([
+                {"type": "Ready", "status": "True"},
+                {"type": "RequiredPackages", "status": "False",
+                 "message": "Missing packages: [nfs-common open-iscsi]"},
+                {"type": "KernelModulesLoaded", "status": "False",
+                 "message": "Kernel modules [iscsi_tcp] are not loaded"},
+            ])),
+            node("vps-3", json!([{"type": "Ready", "status": "False"}])),
+        ]});
+        assert_eq!(
+            unprepared_nodes(&list),
+            [
+                "node vps-2 is not prepared for Longhorn (Missing packages: [nfs-common \
+                 open-iscsi]; Kernel modules [iscsi_tcp] are not loaded): run zeabur-installer \
+                 apply on it, then restart its Longhorn manager, which only checks the node \
+                 again when it starts: kubectl -n longhorn-system delete pod -l \
+                 app=longhorn-manager --field-selector spec.nodeName=vps-2"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_health_check_waits_for_its_objects_to_exist_before_its_condition() {
+        let check = Health {
+            name: "nodes-ready".to_owned(),
+            wait: [
+                "--for=condition=Ready",
+                "nodes.longhorn.io",
+                "--all",
+                "-n",
+                "longhorn-system",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            timeout: "60s".to_owned(),
+            advice: String::new(),
+        };
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let result = wait_health(&check, "--timeout=60s", |args| {
+            calls.push(args.iter().map(|&a| a.to_owned()).collect());
+            Ok::<(), ()>(())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            calls,
+            [
+                [
+                    "--for=create",
+                    "nodes.longhorn.io",
+                    "--all",
+                    "-n",
+                    "longhorn-system",
+                    "--timeout=60s"
+                ],
+                [
+                    "--for=condition=Ready",
+                    "nodes.longhorn.io",
+                    "--all",
+                    "-n",
+                    "longhorn-system",
+                    "--timeout=60s"
+                ],
+            ]
+        );
+
+        let mut conditions = false;
+        let result = wait_health(&check, "--timeout=60s", |args| {
+            conditions |= args[0] != "--for=create";
+            Err(())
+        });
+        assert_eq!(result, Err(()));
+        assert!(
+            !conditions,
+            "the condition is not waited for when no object appeared"
         );
     }
 
@@ -544,8 +781,8 @@ mod tests {
             check("manager", "deployment/manager"),
             check("nodes-ready", "nodes.longhorn.io"),
         ];
-        assert_eq!(failed_health(&checks, |_| true), Vec::<String>::new());
-        let failed = failed_health(&checks, |args| !args.contains(&"nodes.longhorn.io"));
+        assert_eq!(failed_health(&checks, |_, _| true), Vec::<String>::new());
+        let failed = failed_health(&checks, |check, _| check.name != "nodes-ready");
         assert_eq!(
             failed,
             [
