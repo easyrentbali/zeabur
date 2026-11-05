@@ -51,15 +51,13 @@ fn compatible_crd(expected: &Value, current: &Value) -> bool {
     let Some(current_versions) = current_spec.pointer("/versions").and_then(Value::as_array) else {
         return false;
     };
-    if current_versions.len() != expected_versions.len() {
-        return false;
-    }
     expected_versions.iter().all(|expected_version| {
         let name = text(expected_version, "/name");
         let Some(current_version) = current_versions.iter().find(|version| text(version, "/name") == name) else {
             return false;
         };
-        if expected_version.pointer("/schema") != current_version.pointer("/schema") {
+        if expected_version.pointer("/schema").zip(current_version.pointer("/schema"))
+            .is_some_and(|(expected_schema, current_schema)| !subset(expected_schema, current_schema)) {
             return false;
         }
         (!expected_version.pointer("/served").and_then(Value::as_bool).unwrap_or(false)
@@ -437,6 +435,9 @@ mod tests {
         assert!(!satisfied_resource(&expected, &incompatible, &release));
         let mut schema_changed = expected.clone(); schema_changed["spec"]["versions"][0]["schema"] = json!({"openAPIV3Schema":{"type":"object"}});
         assert!(!satisfied_resource(&expected, &schema_changed, &release));
+        let mut newer = expected.clone();
+        newer["spec"]["versions"].as_array_mut().unwrap().push(json!({"name":"v1beta1","served":true,"storage":false}));
+        assert!(satisfied_resource(&expected, &newer, &release));
     }
 
     #[test]
