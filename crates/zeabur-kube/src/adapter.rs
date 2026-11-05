@@ -900,6 +900,56 @@ fn chart_versions(charts: &[DynamicObject]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Retain only image references and metadata from workload reads, never environment values.
+async fn list_workload_images<T>(
+    api: Api<T>,
+    resource: &str,
+    kind: &str,
+) -> Result<Listed<crate::WorkloadImages>, ClusterError>
+where
+    T: kube::Resource + Clone + DeserializeOwned + serde::Serialize + std::fmt::Debug,
+{
+    match list_kind(api, resource).await? {
+        Listed::Refused(refused) => Ok(Listed::Refused(refused)),
+        Listed::Items(items) => items
+            .into_iter()
+            .map(|item| {
+                let value =
+                    serde_json::to_value(item).map_err(|e| ClusterError::Decode(e.to_string()))?;
+                let metadata = value.get("metadata").cloned().unwrap_or_default();
+                Ok(crate::WorkloadImages {
+                    kind: kind.to_owned(),
+                    namespace: metadata["namespace"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    name: metadata["name"].as_str().unwrap_or_default().to_owned(),
+                    labels: serde_json::from_value(
+                        metadata
+                            .get("labels")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    )
+                    .map_err(|e| ClusterError::Decode(e.to_string()))?,
+                    images: value
+                        .pointer("/spec/template/spec/containers")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| {
+                            Some((
+                                c["name"].as_str()?.to_owned(),
+                                c["image"].as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, ClusterError>>()
+            .map(Listed::Items),
+    }
+}
+
 /// Helm releases (from release Secrets' labels, never decoded) and workload labels, for
 /// capability detection.
 async fn releases_and_workloads(
@@ -917,9 +967,17 @@ async fn releases_and_workloads(
                 Err(error) => refusal(error, "secrets"),
             }
         },
-        list_metadata(Api::<Deployment>::all(c()), "deployments.apps"),
-        list_metadata(Api::<StatefulSet>::all(c()), "statefulsets.apps"),
-        list_metadata(Api::<DaemonSet>::all(c()), "daemonsets.apps"),
+        list_workload_images(
+            Api::<Deployment>::all(c()),
+            "deployments.apps",
+            "Deployment"
+        ),
+        list_workload_images(
+            Api::<StatefulSet>::all(c()),
+            "statefulsets.apps",
+            "StatefulSet"
+        ),
+        list_workload_images(Api::<DaemonSet>::all(c()), "daemonsets.apps", "DaemonSet"),
     );
     let mut metas = Vec::new();
     take(helm_secrets?, &mut metas, &mut facts.unreadable);
@@ -931,18 +989,13 @@ async fn releases_and_workloads(
             Some(format!("{}/{name}", m.namespace.unwrap_or_default()))
         })
         .collect();
-    for (kind, listed) in [
-        ("Deployment", deployments?),
-        ("StatefulSet", stateful_sets?),
-        ("DaemonSet", daemon_sets?),
-    ] {
-        let mut metas = Vec::new();
-        take(listed, &mut metas, &mut facts.unreadable);
-        facts.workload_labels.extend(
-            metas
-                .into_iter()
-                .map(|m| (kind.to_owned(), m.labels.unwrap_or_default())),
-        );
+    for listed in [deployments?, stateful_sets?, daemon_sets?] {
+        let mut workloads = Vec::new();
+        take(listed, &mut workloads, &mut facts.unreadable);
+        facts
+            .workload_labels
+            .extend(workloads.iter().map(|w| (w.kind.clone(), w.labels.clone())));
+        facts.workload_images.extend(workloads);
     }
     Ok(())
 }

@@ -484,3 +484,15 @@ async fn component_install_expired_consent_requires_explicit_read_only_remaining
     let (status,changed) = send(&router,"POST",resume,Some(&json!({"component":"node-updates/system-upgrade-controller"}))).await;
     assert_eq!(status,StatusCode::CONFLICT,"{changed}");assert_eq!(writes(&cluster),before);
 }
+
+
+#[tokio::test]
+async fn component_install_exposes_structured_missing_catalog_requirements() {
+    let cluster = cluster();
+    let router = app(&cluster);
+    let (status, response) = send(&router, "GET", "/api/v1/cluster/components/logs/victoria-logs/installation", None).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["installable"], false);
+    assert!(response["missingPrerequisites"].as_array().unwrap().iter().any(|r| r == "observability-operator/victoria-metrics-operator"));
+    assert_eq!(writes(&cluster), 0);
+}

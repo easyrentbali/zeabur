@@ -1,0 +1,11 @@
+# ERB component catalogue repair, 2026-11-06
+
+The fork remains in the sibling `_projects/zeabur` checkout on `erb-dashboard-install`. This scope adds configured workload image provenance separately from chart versions, with image-tag or single-container workload app-version sources. Digest-only images remain explicit references; no chart comparison is invented for raw manifests. Full workloads are read under the existing person permissions; only metadata and container image references enter cluster facts, never environment or Secret data.
+
+Missing prerequisites are returned as catalogue identifiers. The dashboard opens the related installer using the same signed-in administrator, review/apply and readiness flow, and offers a return to the original component. Missing permissions, foreign ownership and genuine conflicts stay visible.
+
+Source audit: GitHub and a fresh fetch identify upstream `e5a28274f5364c68936ea7a6005007428d75504b`; prior fork `1ce5db19cb2aef7d41fdb7e6e4f17f86119cc895` diverged by 15 fork commits and 13 upstream commits. The upstream changes cover installer networking, Longhorn host preparation, health checks and documentation; integration follows this scoped fix without rewriting fork history.
+
+Local focused frontend tests and typecheck run; no local server or production write. Rust tests cannot compile on this host because the installed nightly lacks a C linker and rustfmt, and the catalogue build requires the Nix environment. The committed OpenAPI/client already omitted the ERB installation routes before this change; real regeneration is required in CI, not a hand-written generated-file patch. Run `nix develop -c cargo xtask openapi` (or `ZEABUR_UPDATE_OPENAPI=1 cargo nextest run --locked -p zeabur-api committed`, then `bun run gen:api` in `web`) and commit `crates/zeabur-api/openapi.yaml` and `web/src/api/zeabur.ts` before the exact-source production build. Component installation status has a distinct `ComponentInstallation` schema name to prevent colliding with catalogue `Installation`.
+
+Root owns remote Rust checks, generated artifact integration, rebuild/deployment and authenticated hosted acceptance. None is claimed by this source change.

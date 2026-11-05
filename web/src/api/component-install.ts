@@ -8,6 +8,7 @@ export interface ComponentInstallation {
   inputs: ComponentInput[]
   installable: boolean
   reasons: string[]
+  missingPrerequisites: string[]
   state: "notInstalled" | "pending" | "installed" | "failed" | "external"
   resources: { kind: string; name: string; namespace: string }[]
   message: string
@@ -36,7 +37,11 @@ export interface ComponentInstallPlan {
     afterYaml: string
   }[]
   warnings: string[]
-  phases?: { index: number; title: string; resources: { kind: string; name: string; namespace: string }[] }[]
+  phases?: {
+    index: number
+    title: string
+    resources: { kind: string; name: string; namespace: string }[]
+  }[]
 }
 
 export interface ComponentInstallSubmission {

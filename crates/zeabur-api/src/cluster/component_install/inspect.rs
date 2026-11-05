@@ -273,18 +273,24 @@ pub(super) async fn ingress_conflicts(cluster: &dyn Cluster, observations: &mut 
     Ok(conflicts)
 }
 
+/// Missing catalogue requirements, retained as identifiers so clients can offer the related installer.
+pub(super) fn missing_prerequisites(guide: &install::InstallGuide, capabilities: &[zeabur_catalog::Capability]) -> Vec<String> {
+    guide.requires.iter().filter(|requirement| {
+        let (capability,id) = requirement.split_once('/').map_or((requirement.as_str(),None),|(c,i)| (c,Some(i)));
+        !capabilities.iter().find(|c| c.name == capability).is_some_and(|c| {
+            if let Some(id) = id { c.installations.iter().any(|i| i.component == id) } else { c.existing }
+        })
+    }).cloned().collect()
+}
+
 pub(super) async fn inspect(cluster: &dyn Cluster, state: &AppState, component: &str, guide: &install::InstallGuide, shape: &native::NativeInstall) -> Result<Inspection,ApiError> {
     let mut out = Inspection { state:"notInstalled".to_owned(), reasons:Vec::new(), observations:Vec::new(), existing_namespaces:Vec::new(), satisfied:Vec::new() };
     let facts = cluster.cluster_facts().await.map_err(|_| problem(Kind::Unavailable,"Cannot verify cluster component inventory."))?;
     if !facts.unreadable.is_empty() { out.reasons.push("The component inventory is incomplete; cluster-wide read permissions are required.".to_owned()); }
     if !matches!(zeabur_catalog::distribution(&facts),Some("k3s" | "rke2")) { out.reasons.push("Dashboard installs require an existing K3s/RKE2 Helm controller.".to_owned()); }
     let capabilities = zeabur_catalog::detect(&state.catalogue,&facts);
-    for requirement in &guide.requires {
-        let (capability,id) = requirement.split_once('/').map_or((requirement.as_str(),None),|(c,i)| (c,Some(i)));
-        let fulfilled = capabilities.iter().find(|c| c.name == capability).is_some_and(|c| {
-            if let Some(id) = id { c.installations.iter().any(|i| i.component == id) } else { c.existing }
-        });
-        if !fulfilled { out.reasons.push(format!("Missing prerequisite {requirement}.")); }
+    for requirement in missing_prerequisites(guide, &capabilities) {
+        out.reasons.push(format!("Missing prerequisite {requirement}."));
     }
     for packaged in &guide.replaces_k3s_packaged {
         if facts.k3s_helm_charts.contains_key(&format!("kube-system/{packaged}")) || facts.k3s_helm_charts.contains_key(&format!("kube-system/rke2-{packaged}")) {

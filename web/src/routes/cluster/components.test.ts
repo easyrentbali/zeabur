@@ -13,7 +13,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 
 import { ApiError, type Problem } from "@/api/client"
 import { capabilitiesQuery } from "@/api/queries"
-import { ComponentsPage } from "@/routes/cluster/components"
+import { ComponentsPage, InstalledVersions } from "@/routes/cluster/components"
 // The page's search and navigation are typed by the app's router (its `Register`), which this
 // test does not run.
 import type {} from "@/router"
@@ -82,5 +82,41 @@ describe("Components", () => {
     )
     expect(markup).toMatch(/role="alert"/)
     expect(markup).not.toMatch(/the installed components/)
+  })
+})
+
+describe("installed version provenance", () => {
+  const base = {
+    component: "traefik",
+    displayName: "Traefik",
+    source: "helm" as const,
+    version: "42.3.0",
+    runtimeImages: [
+      {
+        workload: "DaemonSet/platform/traefik",
+        container: "traefik",
+        image: "traefik:v3.7.17@sha256:fixture",
+        version: "3.7.17",
+      },
+    ],
+  }
+  test("shows application and chart versions without conflating them", () => {
+    const html = renderToStaticMarkup(createElement(InstalledVersions, { installation: base }))
+    expect(html).toContain("3.7.17")
+    expect(html).toContain("Chart 42.3.0")
+    expect(html).toContain("sha256:fixture")
+  })
+  test("digest-only images show explicit provenance instead of an invented version", () => {
+    const html = renderToStaticMarkup(
+      createElement(InstalledVersions, {
+        installation: {
+          ...base,
+          version: null,
+          runtimeImages: [{ ...base.runtimeImages[0]!, version: null }],
+        },
+      }),
+    )
+    expect(html).toContain("Image pinned by digest")
+    expect(html).not.toContain("—")
   })
 })

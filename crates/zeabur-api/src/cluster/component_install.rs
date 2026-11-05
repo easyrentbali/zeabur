@@ -96,12 +96,14 @@ pub struct InstallResource {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Installation {
+pub struct ComponentInstallation {
     pub component: String,
     pub profiles: Vec<String>,
     pub inputs: Vec<install::InstallInput>,
     pub installable: bool,
     pub reasons: Vec<String>,
+    /// Missing catalogue component identifiers; install each using its own reviewed plan.
+    pub missing_prerequisites: Vec<String>,
     pub state: String,
     pub resources: Vec<InstallResource>,
     pub message: String,
@@ -205,8 +207,8 @@ fn random(bytes: usize, encoding: &str) -> Result<String, String> {
 /// Installation eligibility and independently observed progress, without sensitive values.
 #[utoipa::path(get, path = "/api/v1/cluster/components/{capability}/{component}/installation", tag = "cluster",
     operation_id = "getComponentInstallation", params(("capability" = String, Path), ("component" = String, Path)),
-    responses((status = 200, body = Installation), (status = 403, body = Problem, content_type = PROBLEM)))]
-pub(crate) async fn get(State(state): State<AppState>, Person(cluster): Person, Path((capability, component)): Path<(String, String)>) -> Result<Json<Installation>, ApiError> {
+    responses((status = 200, body = ComponentInstallation), (status = 403, body = Problem, content_type = PROBLEM)))]
+pub(crate) async fn get(State(state): State<AppState>, Person(cluster): Person, Path((capability, component)): Path<(String, String)>) -> Result<Json<ComponentInstallation>, ApiError> {
     administrator(cluster.as_ref()).await?;
     let id = format!("{capability}/{component}");
     let guide = install::guide(&id, "single-node").map_err(|_| problem(Kind::NotFound, "Unknown component."))?;
@@ -233,7 +235,8 @@ pub(crate) async fn get(State(state): State<AppState>, Person(cluster): Person, 
         _ if installable => "Ready to preview a create-only installation.",
         _ => "Installation prerequisites must be resolved before applying.",
     }.to_owned();
-    let mut result = Installation { component:id, profiles:guide.profiles, inputs:guide.inputs, installable, reasons, state:current, resources, message, continuation_token:None, phase:0, total_phases:1, resume_available:false };
+    let missing_prerequisites = inspect::missing_prerequisites(&guide, &zeabur_catalog::detect(&state.catalogue,&facts));
+    let mut result = ComponentInstallation { component:id, profiles:guide.profiles, inputs:guide.inputs, installable, reasons, missing_prerequisites, state:current, resources, message, continuation_token:None, phase:0, total_phases:1, resume_available:false };
     phases::progress(cluster.as_ref(),&state,&mut result).await?;
     Ok(Json(result))
 }

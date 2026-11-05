@@ -74,6 +74,24 @@ pub enum ComponentUpgrade {
     Unknown,
 }
 
+/// A configured workload image and its version tag. Digest-only images stay explicitly pinned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeImage {
+    /// Kind/namespace/name of the workload template this reference came from.
+    pub workload: String,
+    /// Container name.
+    pub container: String,
+    /// Full image reference, including any immutable digest.
+    pub image: String,
+    /// Version tag if it is a version; absent for digest-only or unversioned tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// image-tag or workload-app-version (the latter only for a single-container workload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_source: Option<String>,
+}
+
 /// One installed component.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +105,8 @@ pub struct Installation {
     /// The installed chart version, when it can be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Configured workload images; separate from chart versions and chart upgrade comparisons.
+    pub runtime_images: Vec<RuntimeImage>,
     /// The tool that manages it and upgrades it (`k3s`, `RKE2`): never flagged for an upgrade.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_by: Option<String>,
@@ -138,6 +158,60 @@ fn packaged_chart_version(url: &str, name: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_owned())
 }
 
+fn image_version(image: &str) -> Option<String> {
+    let reference = image.split('@').next()?;
+    let (_, tag) = reference.rsplit('/').next()?.rsplit_once(':')?;
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    semver(version).map(|_| version.to_owned())
+}
+
+fn runtime_images(component: &Component, facts: &ClusterFacts) -> Vec<RuntimeImage> {
+    let mut images = Vec::new();
+    for workload in &facts.workload_images {
+        let matches = component.detection.workloads.iter().any(|m| {
+            m.kind == workload.kind
+                && m.labels
+                    .iter()
+                    .all(|(key, value)| workload.labels.get(key) == Some(value))
+        }) || component.detection.helm_charts.iter().any(|chart| {
+            workload
+                .labels
+                .get("helm.sh/chart")
+                .and_then(|label| label.strip_prefix(chart.as_str()))
+                .is_some_and(|rest| rest.starts_with('-'))
+        }) || ["app.kubernetes.io/name", "app"]
+            .iter()
+            .any(|key| workload.labels.get(*key) == Some(&component.id));
+        if !matches {
+            continue;
+        }
+        for (container, image) in &workload.images {
+            let image_tag = image_version(image);
+            let declared = (workload.images.len() == 1)
+                .then(|| workload.labels.get("app.kubernetes.io/version"))
+                .flatten()
+                .filter(|v| semver(v).is_some())
+                .cloned();
+            let source = if image_tag.is_some() {
+                Some("image-tag".to_owned())
+            } else if declared.is_some() {
+                Some("workload-app-version".to_owned())
+            } else {
+                None
+            };
+            images.push(RuntimeImage {
+                workload: format!("{}/{}/{}", workload.kind, workload.namespace, workload.name),
+                container: container.clone(),
+                image: image.clone(),
+                version: image_tag.or(declared),
+                version_source: source,
+            });
+        }
+    }
+    images.sort_by(|a, b| (&a.workload, &a.container).cmp(&(&b.workload, &b.container)));
+    images
+}
+
 /// The installation of `component`, which detection found; `distribution` is the catalogue's
 /// name for the cluster's distribution.
 #[must_use]
@@ -151,6 +225,7 @@ pub fn installation(
         display_name: component.display_name.clone(),
         source: InstallSource::Other,
         version: None,
+        runtime_images: runtime_images(component, facts),
         managed_by: None,
         tested: component.tested_version.clone(),
         upgrade: None,
@@ -221,6 +296,90 @@ mod tests {
             .into_iter()
             .find(|c| c.id == id)
             .unwrap()
+    }
+
+    #[test]
+    fn runtime_images_are_separate_from_chart_versions() {
+        let mut facts = ClusterFacts::default();
+        facts.workload_images.push(zeabur_kube::WorkloadImages {
+            kind: "DaemonSet".to_owned(),
+            namespace: "platform-system".to_owned(),
+            name: "erb-traefik".to_owned(),
+            labels: [("helm.sh/chart".to_owned(), "traefik-42.3.0".to_owned())].into(),
+            images: [(
+                "traefik".to_owned(),
+                "docker.io/traefik:v3.7.17@sha256:fixture".to_owned(),
+            )]
+            .into(),
+        });
+        let found = installation(&component("traefik"), &facts, Some("k3s"));
+        assert_eq!(found.runtime_images[0].version.as_deref(), Some("3.7.17"));
+        assert_eq!(
+            found.runtime_images[0].workload,
+            "DaemonSet/platform-system/erb-traefik"
+        );
+        assert_ne!(found.runtime_images[0].version, found.version);
+    }
+
+    #[test]
+    fn raw_controller_versions_do_not_invent_chart_comparisons() {
+        let mut facts = ClusterFacts::default();
+        facts.workload_images.push(zeabur_kube::WorkloadImages {
+            kind: "Deployment".to_owned(),
+            namespace: "cert-manager".to_owned(),
+            name: "cert-manager".to_owned(),
+            labels: [(
+                "app.kubernetes.io/name".to_owned(),
+                "cert-manager".to_owned(),
+            )]
+            .into(),
+            images: [(
+                "cert-manager".to_owned(),
+                "quay.io/jetstack/cert-manager-controller:v1.21.3".to_owned(),
+            )]
+            .into(),
+        });
+        let found = installation(&component("cert-manager"), &facts, None);
+        assert_eq!(found.runtime_images[0].version.as_deref(), Some("1.21.3"));
+        assert_eq!(found.version, None);
+        assert_eq!(found.upgrade, None);
+        assert_eq!(image_version("registry.test:5000/app@sha256:fixture"), None);
+        assert_eq!(image_version("app:latest"), None);
+        assert_eq!(
+            image_version("app:v1.2.3-rc.1").as_deref(),
+            Some("1.2.3-rc.1")
+        );
+    }
+
+    #[test]
+    fn a_digest_only_single_controller_exposes_its_declared_version_source() {
+        let mut facts = ClusterFacts::default();
+        facts.workload_images.push(zeabur_kube::WorkloadImages {
+            kind: "DaemonSet".to_owned(),
+            namespace: "platform".to_owned(),
+            name: "traefik".to_owned(),
+            labels: [
+                ("app.kubernetes.io/name".to_owned(), "traefik".to_owned()),
+                ("app.kubernetes.io/version".to_owned(), "3.7.17".to_owned()),
+            ]
+            .into(),
+            images: [("traefik".to_owned(), "traefik@sha256:fixture".to_owned())].into(),
+        });
+        let found = installation(&component("traefik"), &facts, None);
+        assert_eq!(found.runtime_images[0].version.as_deref(), Some("3.7.17"));
+        assert_eq!(
+            found.runtime_images[0].version_source.as_deref(),
+            Some("workload-app-version")
+        );
+        facts.workload_images[0]
+            .images
+            .insert("sidecar".to_owned(), "proxy@sha256:fixture".to_owned());
+        assert!(
+            installation(&component("traefik"), &facts, None)
+                .runtime_images
+                .iter()
+                .all(|image| image.version.is_none())
+        );
     }
 
     #[test]

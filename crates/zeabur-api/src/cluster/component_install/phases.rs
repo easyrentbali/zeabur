@@ -496,7 +496,7 @@ pub(super) async fn resume(cluster: &dyn Cluster,state: &AppState,component: &st
     Ok(InstallPlan { token:seal(state,&claims)?,expires_at:Timestamp::from_second(claims.expires_at).unwrap_or(Timestamp::UNIX_EPOCH).to_string(),component:claims.component,profile:claims.profile,writes,phases:stages,warnings:vec!["Review and explicitly confirm these remaining stages. Completed and partial stages are never replayed.".to_owned()] })
 }
 
-pub(super) async fn progress(cluster: &dyn Cluster,state: &AppState,result: &mut Installation) -> Result<(),ApiError> {
+pub(super) async fn progress(cluster: &dyn Cluster,state: &AppState,result: &mut ComponentInstallation) -> Result<(),ApiError> {
     let (marker,claims,total) = match latest(cluster,state,&result.component).await {
         Ok(Some(value)) => value,
         Ok(None) => return Ok(()),

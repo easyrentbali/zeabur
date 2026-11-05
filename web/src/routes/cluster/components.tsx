@@ -402,6 +402,52 @@ const sourceKey = {
   other: "cluster.sourceOther",
 } as const
 
+type InstallationWithImages = Schemas.Installation & {
+  runtimeImages?: {
+    workload: string
+    container: string
+    image: string
+    version?: string | null
+    versionSource?: string | null
+  }[]
+}
+
+/** Image references identify application builds; chart versions remain explicitly labelled. */
+export function InstalledVersions({ installation }: { installation: InstallationWithImages }) {
+  const images = installation.runtimeImages ?? []
+  const versions = [...new Set(images.flatMap((image) => (image.version ? [image.version] : [])))]
+  const pinned = images.length > 0 && versions.length === 0
+  return (
+    <span className="flex max-w-64 flex-col items-end gap-1 text-right text-xs" translate="no">
+      {versions.length > 0 ? <span className="font-mono">{versions.join(", ")}</span> : null}
+      {installation.version ? (
+        <span className={versions.length > 0 ? "text-muted-foreground" : "font-mono"}>
+          Chart {installation.version}
+        </span>
+      ) : null}
+      {pinned ? <span>Image pinned by digest</span> : null}
+      {!installation.version && images.length === 0 ? (
+        <span className="text-muted-foreground">Version unavailable from workload metadata</span>
+      ) : null}
+      {images.length > 0 ? (
+        <details className="text-muted-foreground">
+          <summary className="cursor-pointer">Image references</summary>
+          <ul className="max-w-96 space-y-1 break-all pt-1 text-left font-mono">
+            {images.map((image) => (
+              <li key={`${image.workload}/${image.container}`}>
+                {image.workload} · {image.container}: {image.image}
+                {image.versionSource === "workload-app-version"
+                  ? " (version from workload label)"
+                  : ""}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </span>
+  )
+}
+
 function InstalledSection() {
   const t = useT()
   const capLabel = useCapabilityLabel()
@@ -436,9 +482,7 @@ function InstalledSection() {
                 </span>
               </span>
               <span className="flex min-w-0 flex-col items-end gap-1 sm:flex-row sm:items-center sm:gap-4">
-                <span className="max-w-40 truncate type-mono sm:w-40" translate="no">
-                  {i.version ?? <span className="text-muted-foreground">—</span>}
-                </span>
+                <InstalledVersions installation={i} />
                 <span className="flex justify-end gap-1.5 sm:w-44">
                   {isDown(capability, i.component) ? (
                     <StatusPill health="fail" size="sm">
