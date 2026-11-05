@@ -92,9 +92,17 @@ fn compatible_crd(expected: &Value, current: &Value) -> bool {
         let Some(current_version) = current_versions.iter().find(|version| text(version, "/name") == name) else {
             return false;
         };
-        if expected_version.pointer("/schema").zip(current_version.pointer("/schema"))
-            .is_some_and(|(expected_schema, current_schema)| !schema_compatible(expected_schema, current_schema)) {
-            return false;
+        match (
+            expected_version.pointer("/schema/openAPIV3Schema"),
+            current_version.pointer("/schema/openAPIV3Schema"),
+        ) {
+            (Some(expected_schema), Some(current_schema)) => {
+                if !schema_compatible(expected_schema, current_schema) {
+                    return false;
+                }
+            }
+            (Some(_), None) => return false,
+            _ => {}
         }
         (!expected_version.pointer("/served").and_then(Value::as_bool).unwrap_or(false)
             || current_version.pointer("/served").and_then(Value::as_bool) == Some(true))
@@ -463,9 +471,9 @@ mod tests {
     }
 
     #[test]
-    fn compatible_skip_if_present_resources_are_satisfied_only_on_exact_spec() {
+    fn compatible_skip_if_present_resources_preserve_required_contract() {
         let release = native::NativeRelease { name: "gateway".to_owned(), namespace: "kube-system".to_owned(), skip_if_present: vec!["gateways.gateway.networking.k8s.io".to_owned()] };
-        let expected = json!({"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gateways.gateway.networking.k8s.io"},"spec":{"group":"gateway.networking.k8s.io","scope":"Namespaced","names":{"plural":"gateways"},"versions":[{"name":"v1","served":true,"storage":true}]}});
+        let expected = json!({"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gateways.gateway.networking.k8s.io"},"spec":{"group":"gateway.networking.k8s.io","scope":"Namespaced","names":{"plural":"gateways"},"versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object"}}}]}});
         assert!(satisfied_resource(&expected, &expected, &release));
         let mut incompatible = expected.clone(); incompatible["spec"]["versions"][0]["name"] = json!("v1beta1");
         assert!(!satisfied_resource(&expected, &incompatible, &release));
@@ -483,6 +491,24 @@ mod tests {
         let mut current = expected.clone();
         current["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["addresses"] = json!({"type":"array"});
         assert!(satisfied_resource(&expected, &current, &release));
+        current["spec"]["versions"].as_array_mut().unwrap().push(json!({"name":"v1beta1","served":true,"storage":false}));
+        assert!(satisfied_resource(&expected, &current, &release));
+
+        let mut incompatible = current.clone();
+        incompatible["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["listeners"]["items"]["type"] = json!("string");
+        assert!(!satisfied_resource(&expected, &incompatible, &release));
+        incompatible = current.clone();
+        incompatible["spec"]["versions"][0].as_object_mut().unwrap().remove("schema");
+        assert!(!satisfied_resource(&expected, &incompatible, &release));
+        incompatible = current.clone();
+        incompatible["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"].as_object_mut().unwrap().remove("listeners");
+        assert!(!satisfied_resource(&expected, &incompatible, &release));
+        incompatible = current.clone();
+        incompatible["spec"]["scope"] = json!("Cluster");
+        assert!(!satisfied_resource(&expected, &incompatible, &release));
+        incompatible = current.clone();
+        incompatible["spec"]["group"] = json!("other.example.com");
+        assert!(!satisfied_resource(&expected, &incompatible, &release));
     }
 
     #[test]
