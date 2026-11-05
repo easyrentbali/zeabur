@@ -32,6 +32,42 @@ fn subset(expected: &Value, current: &Value) -> bool {
     }
 }
 
+/// CRD schemas may gain optional fields and served versions between catalogue
+/// releases. Keep the identity and structural type contract strict while
+/// allowing those additive changes to remain under their existing owner.
+fn schema_compatible(expected: &Value, current: &Value) -> bool {
+    let (Value::Object(expected), Value::Object(current)) = (expected, current) else {
+        return expected == current;
+    };
+    for field in ["type", "x-kubernetes-preserve-unknown-fields", "x-kubernetes-int-or-string"] {
+        if expected.get(field).is_some() && expected.get(field) != current.get(field) {
+            return false;
+        }
+    }
+    if let Some(properties) = expected.get("properties").and_then(Value::as_object) {
+        let Some(current_properties) = current.get("properties").and_then(Value::as_object) else {
+            return false;
+        };
+        for (name, expected_property) in properties {
+            let Some(current_property) = current_properties.get(name) else {
+                return false;
+            };
+            if !schema_compatible(expected_property, current_property) {
+                return false;
+            }
+        }
+    }
+    if let Some(expected_items) = expected.get("items") {
+        let Some(current_items) = current.get("items") else {
+            return false;
+        };
+        if !schema_compatible(expected_items, current_items) {
+            return false;
+        }
+    }
+    true
+}
+
 fn compatible_crd(expected: &Value, current: &Value) -> bool {
     let Some(expected_spec) = expected.pointer("/spec") else { return false; };
     let Some(current_spec) = current.pointer("/spec") else { return false; };
@@ -57,7 +93,7 @@ fn compatible_crd(expected: &Value, current: &Value) -> bool {
             return false;
         };
         if expected_version.pointer("/schema").zip(current_version.pointer("/schema"))
-            .is_some_and(|(expected_schema, current_schema)| !subset(expected_schema, current_schema)) {
+            .is_some_and(|(expected_schema, current_schema)| !schema_compatible(expected_schema, current_schema)) {
             return false;
         }
         (!expected_version.pointer("/served").and_then(Value::as_bool).unwrap_or(false)
@@ -433,11 +469,20 @@ mod tests {
         assert!(satisfied_resource(&expected, &expected, &release));
         let mut incompatible = expected.clone(); incompatible["spec"]["versions"][0]["name"] = json!("v1beta1");
         assert!(!satisfied_resource(&expected, &incompatible, &release));
-        let mut schema_changed = expected.clone(); schema_changed["spec"]["versions"][0]["schema"] = json!({"openAPIV3Schema":{"type":"object"}});
+        let mut schema_changed = expected.clone(); schema_changed["spec"]["versions"][0]["schema"] = json!({"openAPIV3Schema":{"type":"array"}});
         assert!(!satisfied_resource(&expected, &schema_changed, &release));
         let mut newer = expected.clone();
         newer["spec"]["versions"].as_array_mut().unwrap().push(json!({"name":"v1beta1","served":true,"storage":false}));
         assert!(satisfied_resource(&expected, &newer, &release));
+    }
+
+    #[test]
+    fn additive_crd_schema_and_versions_remain_satisfied() {
+        let release = native::NativeRelease { name: "gateway".to_owned(), namespace: "kube-system".to_owned(), skip_if_present: vec!["gateways.gateway.networking.k8s.io".to_owned()] };
+        let expected = json!({"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gateways.gateway.networking.k8s.io"},"spec":{"group":"gateway.networking.k8s.io","scope":"Namespaced","names":{"plural":"gateways","singular":"gateway"},"versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","properties":{"spec":{"type":"object","properties":{"listeners":{"type":"array","items":{"type":"object"}}}}}}}}]}});
+        let mut current = expected.clone();
+        current["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["addresses"] = json!({"type":"array"});
+        assert!(satisfied_resource(&expected, &current, &release));
     }
 
     #[test]
