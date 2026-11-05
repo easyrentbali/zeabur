@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-use super::{File, Input, PROFILES, Rendered, Source, bundle, merge, parse_values, set_path};
+use super::{File, Generate, Input, PROFILES, Rendered, Source, bundle, merge, parse_values, set_path};
 
 /// A pinned release and the namespace its Helm release belongs to.
 #[derive(Debug, Clone)]
@@ -89,14 +89,17 @@ fn input_value(
     random: &mut impl FnMut(usize, &str) -> Result<String, String>,
 ) -> Result<Value, String> {
     if let Some(generator) = &input.generate {
-        if generator == "clusterIP" {
+        if matches!(generator, Generate::ClusterIp) {
             return Err("Builder installation requires a reserved ServiceCIDR address and node registry CA trust. Configure the existing build integration before installing Builder from the dashboard.".to_owned());
         }
-        if supplied.is_some() || generator != "random" {
+        let Generate::Random { bytes, encoding } = generator else {
+            return Err(format!("Input {} must use its supported server generator.", input.name));
+        };
+        if supplied.is_some() {
             return Err(format!("Input {} must use its supported server generator.", input.name));
         }
-        let bytes = input.generate_bytes.unwrap_or(64) as usize;
-        let encoding = input.generate_encoding.as_deref().unwrap_or("hex");
+        let bytes = *bytes as usize;
+        let encoding = encoding.as_str();
         if !(1..=4096).contains(&bytes) || !["hex", "base64url"].contains(&encoding) {
             return Err(format!("Input {} has unsupported random encoding or length.", input.name));
         }
@@ -140,6 +143,9 @@ fn render_file(
     if file.releases.is_empty() {
         return Err("The component has no installation resources.".to_owned());
     }
+    if let Some(reason) = file.unknown() {
+        return Err(format!("Unsupported catalogue installation: {reason}."));
+    }
     if inputs.len() > 64 || inputs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() > 65_536
         || inputs.keys().any(|k| !file.inputs.iter().any(|i| i.name == *k)) {
         return Err("Unknown or oversized installation inputs.".to_owned());
@@ -153,8 +159,7 @@ fn render_file(
             return Err("Duplicate catalogue input.".to_owned());
         }
     }
-    let security = if file.security.privileged { Some("privileged") }
-        else { file.security.level.as_deref() };
+    let security = Some(file.security.pod_security.as_str());
     let mut namespaces: BTreeSet<String> = file.releases.iter().map(|r| r.namespace.clone()).collect();
     namespaces.extend(file.inputs.iter().filter_map(|i| i.secret.as_ref().map(|s| s.namespace.clone())));
     let mut objects = Vec::new();
@@ -181,7 +186,7 @@ fn render_file(
         // stringData never enters a URL, command line, log, or plaintext plan response.
         objects.push(NativeObject { object: std::mem::take(&mut object), preview });
     }
-    let first = file.releases.first().map(|r| r.name.as_str());
+    let first = file.releases.iter().find(|r| r.is_chart()).map(|r| r.name.as_str());
     let mut releases = Vec::new();
     let mut phases = Vec::new();
     for release in &file.releases {
@@ -235,8 +240,8 @@ fn render_file(
         phases = vec![NativePhase { name:"Install Helm releases".to_owned(), objects:(0..objects.len()).collect(), releases:releases.clone() }];
     }
     let contributions = file.contributes.iter().map(|c| {
-        if c.release.is_empty() || c.values.is_empty() { return Err("Invalid catalogue release contribution.".to_owned()); }
-        Ok(NativeContribution { component:c.target.clone(), release:c.release.clone(), values:parse_values(Some(&c.values))? })
+        if c.target.release.is_empty() || c.values.is_empty() { return Err("Invalid catalogue release contribution.".to_owned()); }
+        Ok(NativeContribution { component:c.target.component.clone(), release:c.target.release.clone(), values:parse_values(Some(&c.values))? })
     }).collect::<Result<Vec<_>,String>>()?;
     Ok(NativeInstall { releases, objects, pod_security: security.map(str::to_owned), phases, contributions })
 }
@@ -254,12 +259,12 @@ inputs:
     secret: {name: auth, key: token, namespace: reloader}
   - name: random-key
     description: Generated key
-    generate: random
-    generateBytes: 24
-    generateEncoding: base64url
+    generate: {type: random, bytes: 24, encoding: base64url}
     path: auth.random
+security: {podSecurity: baseline}
 releases:
   - name: reloader
+    type: helm
     namespace: reloader
     chart: reloader
     repo: https://stakater.github.io/stakater-charts
@@ -296,9 +301,49 @@ releases:
             let values = BTreeMap::from([("token".to_owned(), "a".to_owned()), (name.to_owned(), "b".to_owned())]);
             assert!(render_file(&file, "single-node", &values, &mut random).is_err());
         }
-        let manifest: File = serde_saphyr::from_str("releases: [{name: unsafe, namespace: x, manifests: 'kind: Namespace'}]").unwrap();
+        let manifest: File = serde_saphyr::from_str("security: {podSecurity: baseline}\nreleases: [{name: unsafe, type: inline, namespace: x, manifests: 'kind: Namespace'}]").unwrap();
         assert!(render_file(&manifest, "single-node", &BTreeMap::new(), &mut random).is_err());
         assert!(render("no/such-component", "single-node", &BTreeMap::new(), random).is_err());
+    }
+
+    #[test]
+    fn native_v3_rejects_unknown_generators_security_and_release_types() {
+        for source in [
+            FILE.replace("type: random", "type: unknown-generator"),
+            FILE.replace("podSecurity: baseline", "podSecurity: unknown-level"),
+            FILE.replace("type: helm", "type: unknown-release"),
+            FILE.replace("bytes: 24", "bytes: 0"),
+            FILE.replace("encoding: base64url", "encoding: unknown-encoding"),
+        ] {
+            let file: File = serde_saphyr::from_str(&source).unwrap();
+            let mut random = |_: usize, _: &str| panic!("invalid schema must not generate values");
+            assert!(render_file(&file, "single-node", &BTreeMap::from([("token".to_owned(), "fixture".to_owned())]), &mut random).is_err());
+        }
+    }
+
+    #[test]
+    fn native_v3_retains_contribution_release_identity_and_security() {
+        let source = format!("{FILE}\ncontributes:\n  - target: {{component: metrics/victoria-metrics, release: metrics}}\n    values: 'replicas: 3'\n");
+        let file: File = serde_saphyr::from_str(&source).unwrap();
+        let rendered = render_file(&file, "single-node", &BTreeMap::from([("token".to_owned(), "fixture".to_owned())]), &mut |_, _| Ok("random".to_owned())).unwrap();
+        assert_eq!(rendered.pod_security.as_deref(), Some("baseline"));
+        assert_eq!(rendered.objects[0].object["metadata"]["labels"]["pod-security.kubernetes.io/enforce"], "baseline");
+        assert_eq!(rendered.contributions.len(), 1);
+        assert_eq!(rendered.contributions[0].component, "metrics/victoria-metrics");
+        assert_eq!(rendered.contributions[0].release, "metrics");
+        assert_eq!(rendered.contributions[0].values["replicas"], 3);
+    }
+
+    #[test]
+    fn native_inputs_default_to_first_chart_after_manifest_phases() {
+        let source = FILE.replace("releases:\n", "releases:\n  - name: prerequisite\n    type: inline\n    namespace: reloader\n    manifests: |\n      apiVersion: v1\n      kind: ConfigMap\n      metadata: {name: prerequisite}\n");
+        let file: File = serde_saphyr::from_str(&source).unwrap();
+        let rendered = render_file(&file, "single-node", &BTreeMap::from([("token".to_owned(), "fixture".to_owned())]), &mut |_, _| Ok("random".to_owned())).unwrap();
+        let chart = rendered.objects.iter().find(|entry| entry.object["kind"] == "HelmChart").unwrap();
+        let values: Value = serde_saphyr::from_str(chart.object["spec"]["valuesContent"].as_str().unwrap()).unwrap();
+        assert_eq!(values["auth"]["token"], "fixture");
+        assert_eq!(values["auth"]["random"], "random");
+        assert_eq!(rendered.phases.len(), 2);
     }
 
     #[test]

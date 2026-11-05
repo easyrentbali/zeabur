@@ -6,16 +6,18 @@ description: Investigate a failed or flaky CI or release run of Zeabur (GitHub A
 # When CI fails
 
 Follow `zeabur-oss-ci` (install: `npx skills add zeabur-oss/skills --skill zeabur-oss-ci`;
-`skills-lock.json` pins it): how the shared workflows call `scripts/ci.sh`, reading the log,
+`skills-lock.json` pins it): how CI runs `scripts/ci/<job>.sh`, reading the log,
 finding the cause, reproducing, fixing, and its release recovery notes. This skill adds Zeabur's
 jobs and tools.
 
 ## Jobs
 
-`scripts/ci.sh --list`: the checks (format, clippy, docs, test, cargo-deny, unsafe-report,
-levels, fuzz, ui, no-ui, chart, wording), `kubernetes` (cluster tests, `zeaburctl doctor`,
-browser tests in local mode) and `kubernetes-l2` (Zeabur and Zeabur Identity in a cluster,
-`scripts/e2e-l2.sh`), both on `scripts/dev-cluster.sh`. What each cluster job runs is in
+The jobs of `.github/workflows/ci.yml`, each `nix develop -c scripts/ci/<job>.sh`: `lint`
+(format, clippy, docs, cargo-deny, unsafe-report, levels, chart in a row), `test` and `ui` on every
+pull request; `fuzz`, `no-ui`, `wording`, `cluster` (cluster tests, `zeaburctl doctor`,
+browser tests in local mode) and `e2e` (Zeabur and Zeabur Identity in a cluster,
+`scripts/e2e.sh`) only in the merge queue, on a tag, nightly and by hand; the cluster jobs run on
+`scripts/dev-cluster.sh`. What each cluster job runs is in
 `zeabur-cluster-tests`.
 
 `.github/workflows/release.yml` runs on a `vX.Y.Z` or `vX.Y.Z-<pre-release>` tag: zeabur-oss/.github's
@@ -38,7 +40,7 @@ Linux), `sign` (macOS), `publish`, `attest`, `finish` (the installers),
 
 ```sh
 rsync -a --delete --exclude target --exclude node_modules --exclude web/dist ./ host:zeabur/
-ssh host 'cd zeabur && scripts/ci.sh kubernetes'           # one job
+ssh host 'cd zeabur && nix develop -c scripts/ci/cluster.sh'   # one job
 ssh host 'cd zeabur && scripts/ci-local.sh'                # every job, a result line each
 ```
 - `scripts/ci-local.sh [job…]` runs each job in its own copy of the checkout, three at a time
@@ -46,8 +48,9 @@ ssh host 'cd zeabur && scripts/ci-local.sh'                # every job, a result
   `target/ci-local/<job>.result`, logs next to them, a failed job's copy kept under `work/`. Its
   header documents the settings.
 - It refuses to start with less than 25 GB free (`CI_LOCAL_MIN_FREE_GB`).
-- The cluster jobs fetch Zeabur Identity at `ZEABUR_IDENTITY_PINNED` from `ZEABUR_IDENTITY_GIT`
-  (default GitHub); point it at a mirror, or set `ZEABUR_IDENTITY_SRC` to a checkout synced along.
+- The cluster jobs download the Zeabur Identity release `ZEABUR_IDENTITY_PINNED` names from
+  GitHub, and the node pulls its image from ghcr.io. Set `ZEABUR_IDENTITY_SRC` to a checkout synced
+  along to build it instead.
 
 ## Fixing
 

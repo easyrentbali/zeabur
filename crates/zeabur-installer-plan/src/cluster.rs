@@ -104,6 +104,25 @@ const RKE2_LAYOUT: Layout = Layout {
     uninstall_agent: "/usr/local/bin/rke2-uninstall.sh",
 };
 
+/// containerd's AppArmor profile for containers, under the name containerd gives it.
+pub const APPARMOR_PROFILE: &str = "/etc/apparmor.d/cri-containerd.apparmor.d";
+
+/// containerd's default profile, which also lets a container's processes signal and trace each
+/// other under the stacked label `cri-containerd.apparmor.d//&unconfined`.
+///
+/// Ubuntu's kernels from 7.0.0-41 on give containers that label when
+/// `kernel.apparmor_restrict_unprivileged_unconfined` is 1, as on Ubuntu 26.04. containerd loads
+/// its own profile only when none of that name is loaded, and `apparmor.service` loads this one at
+/// boot.
+#[must_use]
+pub fn apparmor_profile() -> HostFile {
+    HostFile {
+        path: APPARMOR_PROFILE.to_owned(),
+        mode: 0o644,
+        content: include_str!("cri-containerd.apparmor.d").to_owned(),
+    }
+}
+
 /// The OS at idle, which every team install has.
 const OS_IDLE_MIB: u64 = 350;
 /// Zeabur and Identity at idle.
@@ -127,18 +146,13 @@ const RKE2_STATIC_PODS_REQUEST_MIB: u64 =
 const RKE2_COREDNS_REQUEST_MIB: u64 = 144;
 /// K3s's `CoreDNS`. Calico asks for no memory.
 const K3S_COREDNS_REQUEST_MIB: u64 = 70;
-/// The memory requests of the catalog's default components on one node, sized from what they used
-/// on K3s with 35 pods running.
-const DEFAULT_COMPONENTS_REQUEST_MIB: u64 = 1200;
-/// Zeabur Identity's memory request (identity `crates/zeabur-identity-k8s/src/deployment.rs`).
-const IDENTITY_REQUEST_MIB: u64 = 32;
 /// Zeabur's chart, whose own and proxy requests count.
 const ZEABUR_VALUES: &str = include_str!("../../../deploy/chart/zeabur/values.yaml");
 
-/// The memory requests of Zeabur and its proxy in the chart's values, with Zeabur Identity's.
-fn products_request_mib() -> u64 {
+/// The memory requests of Zeabur and its proxy in the chart's values.
+fn zeabur_request_mib() -> u64 {
     let Ok(values) = serde_saphyr::from_str::<serde_json::Value>(ZEABUR_VALUES) else {
-        return IDENTITY_REQUEST_MIB;
+        return 0;
     };
     let request = |path: &str| {
         values
@@ -147,9 +161,7 @@ fn products_request_mib() -> u64 {
             .and_then(mebibytes)
             .unwrap_or(0)
     };
-    request("/resources/requests/memory")
-        + request("/proxy/resources/requests/memory")
-        + IDENTITY_REQUEST_MIB
+    request("/resources/requests/memory") + request("/proxy/resources/requests/memory")
 }
 
 /// A memory quantity in `Mi` or `Gi`, in MiB.
@@ -312,32 +324,20 @@ impl Distribution {
         OS_IDLE_MIB + self.idle_mib() + ZEABUR_IDLE_MIB
     }
 
-    /// The least memory a team install needs.
+    /// The least memory a team install needs, with `requests_mib` what the components and
+    /// Zeabur Identity ask the scheduler for, and any work one of them does on top.
     ///
     /// The scheduler places a pod only where its memory request fits in what pods may use, so that
     /// must hold the requests of the distribution's own pods (RKE2's static pods and `CoreDNS`,
-    /// K3s's `CoreDNS`), of the default components and of Zeabur as its chart gives them, on top of
-    /// the reserves and the hard eviction threshold, rounded up to a hundred. K3s comes to 3500,
-    /// which a 4 GiB server passes once its crash kernel reserve is off; RKE2 comes to 4300.
+    /// K3s's `CoreDNS`), `requests_mib` and Zeabur's as its chart gives them, on top of the
+    /// reserves and the hard eviction threshold, rounded up to a hundred.
     #[must_use]
-    pub fn min_memory_mib(self) -> u64 {
-        self.min_memory_at_work_mib(0)
-    }
-
-    /// [`Self::min_memory_mib`] with a component that uses `work_mib` more while working, such as
-    /// the builder in a build (`resources.workMemoryMiB` in the catalog).
-    #[must_use]
-    pub fn min_memory_at_work_mib(self, work_mib: u64) -> u64 {
+    pub fn min_memory_mib(self, requests_mib: u64) -> u64 {
         let own_pods = match self {
             Self::K3s => K3S_COREDNS_REQUEST_MIB,
             Self::Rke2 => RKE2_STATIC_PODS_REQUEST_MIB + RKE2_COREDNS_REQUEST_MIB,
         };
-        (own_pods
-            + DEFAULT_COMPONENTS_REQUEST_MIB
-            + products_request_mib()
-            + self.reserved_mib()
-            + EVICTION_HARD_MIB
-            + work_mib)
+        (own_pods + requests_mib + zeabur_request_mib() + self.reserved_mib() + EVICTION_HARD_MIB)
             .div_ceil(100)
             * 100
     }
@@ -658,12 +658,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn k3s_fits_4_gib_without_a_crash_kernel_but_not_a_build_and_rke2_needs_more_than_4_gib() {
-        // What a 4 GiB server reports with its crash kernel reserve off.
-        assert!(Distribution::K3s.min_memory_mib() <= 3900);
-        // The builder's workMemoryMiB in the catalog.
-        assert!(Distribution::K3s.min_memory_at_work_mib(500) > 3900);
-        assert!(Distribution::Rke2.min_memory_mib() > 3900);
+    fn the_minimum_holds_the_requests_on_top_of_the_reserves() {
+        for distribution in Distribution::ALL {
+            let floor = distribution.reserved_mib() + EVICTION_HARD_MIB;
+            assert!(distribution.min_memory_mib(0) >= floor + zeabur_request_mib());
+            assert_eq!(
+                distribution.min_memory_mib(1000) - distribution.min_memory_mib(0),
+                1000
+            );
+        }
     }
 
     #[test]
@@ -691,14 +694,7 @@ mod tests {
         assert_eq!(mebibytes("16Mi"), Some(16));
         assert_eq!(mebibytes("1Gi"), Some(1024));
         assert_eq!(mebibytes("500M"), None);
-        assert!(products_request_mib() > IDENTITY_REQUEST_MIB + 16);
-    }
-
-    #[test]
-    // docs/*/get-started/personal.mdx
-    fn the_minimums_are_the_ones_the_docs_give() {
-        assert_eq!(Distribution::K3s.min_memory_mib(), 3500);
-        assert_eq!(Distribution::Rke2.min_memory_mib(), 4300);
+        assert!(zeabur_request_mib() > 0);
     }
 
     #[test]
@@ -743,6 +739,28 @@ mod tests {
         for d in Distribution::ALL {
             assert!(has(d, d.join_port()));
             assert!(!d.node_ports(false).iter().any(|(p, _)| *p == 6443));
+        }
+    }
+
+    #[test]
+    fn containerds_profile_keeps_its_name_and_lets_stacked_containers_signal_each_other() {
+        let profile = apparmor_profile();
+        let name = profile.path.rsplit('/').next().unwrap();
+        assert!(
+            profile
+                .content
+                .contains(&format!("\nprofile {name} flags="))
+        );
+        for rule in [
+            "signal (send,receive)",
+            "ptrace (trace,tracedby,read,readby)",
+        ] {
+            assert!(
+                profile
+                    .content
+                    .contains(&format!("  {rule} peer={name}//&unconfined,\n")),
+                "{rule}"
+            );
         }
     }
 }

@@ -454,7 +454,7 @@ async fn component_install_expired_consent_requires_explicit_read_only_remaining
     fn clock() -> Timestamp { Timestamp::from_second(NOW.load(Ordering::SeqCst)).unwrap() }
     NOW.store(1_000,Ordering::SeqCst);
     let cluster = cluster();
-    let router = zeabur_api::router_at(Arc::new(zeabur_api::access::SingleCluster(Arc::new(cluster.clone()))),clock);
+    let router = zeabur_api::router_with(Arc::new(zeabur_api::access::SingleCluster(Arc::new(cluster.clone()))), zeabur_api::Options { clock, ..zeabur_api::Options::default() });
     let request = json!({"component":"node-updates/system-upgrade-controller","profile":"single-node"});
     let (status,planned) = send(&router,"POST",PLAN,Some(&request)).await;assert_eq!(status,StatusCode::OK,"{planned}");
     let (status,submitted) = apply(&router,&planned).await;assert_eq!(status,StatusCode::OK,"{submitted}");

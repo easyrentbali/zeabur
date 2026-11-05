@@ -3,7 +3,7 @@ import type { ReactNode } from "react"
 import XIcon from "~icons/ph/x"
 
 import { capabilitiesQuery } from "@/api/queries"
-import { CopyButton } from "@/components/bits"
+import { Command } from "@/components/bits"
 import { ComponentInstaller } from "@/components/component-install"
 import { Button } from "@zeabur-oss/design-system/components/button"
 import {
@@ -64,9 +64,16 @@ export function InstallerSheet({
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5">
           {reason ? <p className="text-pretty">{reason}</p> : null}
-          {remove ? installer === false ? null : (
-            <InstallerSteps components={components} names={names} remove />
-          ) : <ComponentInstaller key={components.map((entry) => entry.id).join(",")} components={components} />}
+          {remove ? (
+            installer === false ? null : (
+              <InstallerSteps components={components} names={names} remove />
+            )
+          ) : (
+            <ComponentInstaller
+              key={components.map((entry) => entry.id).join(",")}
+              components={components}
+            />
+          )}
           {note ? <p className="type-meta text-pretty text-muted-foreground">{note}</p> : null}
           {remove ? (
             <div className="flex flex-col gap-1 type-meta text-pretty text-muted-foreground">
@@ -139,19 +146,5 @@ function Step({ text, children }: { text: string; children: ReactNode }) {
       <p className="text-pretty">{text}</p>
       {children}
     </section>
-  )
-}
-
-function Command({ text }: { text: string }) {
-  return (
-    <div className="relative min-w-0 rounded-lg border bg-muted/30">
-      <CopyButton value={text} className="absolute top-2 right-2" />
-      <pre
-        className="py-3 pr-12 pl-3 font-mono text-xs leading-5 wrap-anywhere whitespace-pre-wrap"
-        translate="no"
-      >
-        {text}
-      </pre>
-    </div>
   )
 }

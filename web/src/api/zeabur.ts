@@ -13,7 +13,7 @@
  * **Errors.** The problem `kind` and `reason` are open enumerations: expect new values, treat an unknown `kind` by its HTTP status and ignore an unknown `reason`. `429` and `503` carry kube-apiserver's `Retry-After` when it gave one.
  *
  * **Compatibility.** The embedded web interface ships with the API; other clients are not yet promised a stable `/api/v1`.
- * OpenAPI spec version: 0.1.2-beta.2
+ * OpenAPI spec version: 0.2.0-beta.1
  */
 import { zeaburFetch } from "./client"
 /**
@@ -1006,7 +1006,7 @@ export type Component = {
   defaults: ComponentDefaults
   /** Human-readable name. */
   displayName: string
-  /** The distributions it supports (`k3s`, …); empty means all. */
+  /** The distributions it supports (`k3s`, …). */
   distributions: string[]
   /** The project's home page. */
   homepage: string
@@ -2273,7 +2273,7 @@ export type Cluster = {
   /** What you may change in the cluster itself. */
   can: ClusterRights
   /**
-   * The distribution, when the version names one: `k3s` or `rke2`.
+   * The distribution, when the version names one: `k3s`, `rke2` or `kubesolo`.
    * @nullable
    */
   distribution?: string | null
@@ -5973,7 +5973,7 @@ export type IdleUse = {
    * @minimum 0
    */
   cpuMillicores: number
-  /** Where it was measured: `<profile>-<architecture>-<Kubernetes version>`. */
+  /** Where it was measured: `<distribution>-<profile>-<architecture>-<Kubernetes version>`. */
   environment: string
   /** The day it was measured (`2026-10-25`). */
   measuredAt: string
@@ -9771,7 +9771,7 @@ export type Upgrades = {
   /** When the bundled table was copied from the Kubernetes schedule (`YYYY-MM-DD`). */
   dataAsOf: string
   /**
-   * `k3s` or `rke2`, when the version names one.
+   * `k3s`, `rke2` or `kubesolo`, when the version names one.
    * @nullable
    */
   distribution?: string | null
@@ -10002,11 +10002,46 @@ export type WorkloadReleaseList = {
 }
 
 /**
+ * A published release.
+ */
+export type ZeaburRelease = {
+  /** GitHub marks it a pre-release. */
+  prerelease: boolean
+  /** Its notes have a `### Security` section: it fixes vulnerabilities. */
+  security: boolean
+  /** Its page on GitHub, with the release notes. */
+  url: string
+  /** The tag without its `v`, such as `0.1.2`. */
+  version: string
+}
+
+/**
+ * A newer release than the running one.
+ */
+export type ZeaburNewer = {
+  /** The newest normal release, or the newest pre-release when the running version is one. */
+  latest: ZeaburRelease
+  /**
+   * The newer normal releases that fix vulnerabilities, newest first: the running version has
+   * them.
+   */
+  security: ZeaburRelease[]
+}
+
+/**
+ * Whether a newer Zeabur than [`ZeaburVersion::version`] is out, from GitHub's releases as the
+ * server read them last.
+ */
+export type ZeaburUpdate = {
+  newer?: ZeaburNewer | null
+}
+
+/**
  * Zeabur itself: its version, and what the interface needs to say how to upgrade it.
  */
 export type ZeaburVersion = {
   installedBy?: InstallMethod | null
-  /** Whether the interface checks GitHub's releases for a newer version. */
+  /** Whether the interface compares it with GitHub's releases (`GET /cluster/zeabur/update`). */
   updateCheck: boolean
   /** Zeabur's version, such as `0.1.1`; in local mode, `zeaburctl`'s. */
   version: string
@@ -11447,6 +11482,23 @@ export const getZeabur = async (
   options?: Parameters<typeof zeaburFetch>[1],
 ): Promise<ZeaburVersion> => {
   return zeaburFetch<ZeaburVersion>(getGetZeaburUrl(), {
+    ...options,
+    method: "GET",
+  })
+}
+
+export const getGetZeaburUpdateUrl = () => {
+  return `/api/v1/cluster/zeabur/update`
+}
+
+/**
+ * @summary Whether a newer release than the running Zeabur is out. While the update check is off, the
+answer is that none is, and GitHub is not asked.
+ */
+export const getZeaburUpdate = async (
+  options?: Parameters<typeof zeaburFetch>[1],
+): Promise<ZeaburUpdate> => {
+  return zeaburFetch<ZeaburUpdate>(getGetZeaburUpdateUrl(), {
     ...options,
     method: "GET",
   })

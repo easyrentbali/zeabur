@@ -103,7 +103,11 @@ fn components(
         let memory = c
             .idle_memory_mib
             .map_or_else(|| "unmeasured".to_owned(), |m| format!("{m} MiB"));
-        push(s, &format!("  {:<48} {:<10} {memory}", c.id, c.why));
+        let untested = if c.untested { ", untested" } else { "" };
+        push(
+            s,
+            &format!("  {:<48} {:<10} {memory}{untested}", c.id, c.why),
+        );
         for release in &c.releases {
             let what = match release {
                 ReleasePlan::HelmChart { name, object, .. } => format!(
@@ -493,6 +497,7 @@ mod tests {
                 node_ips: vec!["10.0.0.6".to_owned(), "fd00::6".to_owned()],
                 record: None,
                 installer: None,
+                apparmor_restricts_unconfined: false,
             },
             rtt_us: rtt_us.to_vec(),
             ports: vec![

@@ -2,7 +2,7 @@
 
 Development tasks for this repository, in the [cargo xtask](https://github.com/matklad/cargo-xtask)
 convention: `cargo xtask <task>` (an alias in `.cargo/config.toml`) builds and runs this crate.
-Nothing ships it. Git, Docker, k3d, kubectl, Helm, openssl, curl and Nix run as subprocesses;
+Nothing ships it. Git, Docker, k3d, kubectl, Helm, openssl, curl, tar, cosign and Nix run as subprocesses;
 `cargo xtask --help` prints every task, and `cargo xtask <task> --help` its options.
 
 ```sh
@@ -12,7 +12,7 @@ Nothing ships it. Git, Docker, k3d, kubectl, Helm, openssl, curl and Nix run as 
 cargo xtask dev-cluster up [--profile bare|default|full] [--identity-src <dir>]
                            [--builder-src <dir>] [--zeabur-image <image>] [--zeabur-chart <chart>]
 cargo xtask dev-cluster down
-cargo xtask dev-cluster snapshot   # cluster-scoped objects and namespace metadata, for e2e-l2
+cargo xtask dev-cluster snapshot   # cluster-scoped objects and namespace metadata, for e2e
 
 # Zeabur Proxy's canary (scripts/e2e-proxy.sh) on the cluster KUBECONFIG points at: no person
 # reads another namespace's log lines or series. Removes what it made, however it ends, unless

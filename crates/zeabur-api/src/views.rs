@@ -70,7 +70,7 @@ pub struct Cluster {
     pub name_source: crate::settings::cluster_name::NameSource,
     /// kube-apiserver's version (`gitVersion`, such as `v1.36.5+k3s1`).
     pub kubernetes_version: String,
-    /// The distribution, when the version names one: `k3s` or `rke2`.
+    /// The distribution, when the version names one: `k3s`, `rke2` or `kubesolo`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distribution: Option<String>,
     /// How a new service's public URL is made.
@@ -87,11 +87,46 @@ pub struct Cluster {
 pub struct ZeaburVersion {
     /// Zeabur's version, such as `0.1.1`; in local mode, `zeaburctl`'s.
     pub version: String,
-    /// Whether the interface checks GitHub's releases for a newer version.
+    /// Whether the interface compares it with GitHub's releases (`GET /cluster/zeabur/update`).
     pub update_check: bool,
     /// How Zeabur was installed; absent when the person may not read what tells.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_by: Option<InstallMethod>,
+}
+
+/// Whether a newer Zeabur than [`ZeaburVersion::version`] is out, from GitHub's releases as the
+/// server read them last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeaburUpdate {
+    /// Absent when none is out, or while the update check is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newer: Option<ZeaburNewer>,
+}
+
+/// A newer release than the running one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeaburNewer {
+    /// The newest normal release, or the newest pre-release when the running version is one.
+    pub latest: ZeaburRelease,
+    /// The newer normal releases that fix vulnerabilities, newest first: the running version has
+    /// them.
+    pub security: Vec<ZeaburRelease>,
+}
+
+/// A published release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ZeaburRelease {
+    /// The tag without its `v`, such as `0.1.2`.
+    pub version: String,
+    /// Its page on GitHub, with the release notes.
+    pub url: String,
+    /// GitHub marks it a pre-release.
+    pub prerelease: bool,
+    /// Its notes have a `### Security` section: it fixes vulnerabilities.
+    pub security: bool,
 }
 
 /// How Zeabur was installed, which says how to upgrade it.
@@ -596,7 +631,7 @@ pub struct Upgrades {
     pub id: String,
     /// kube-apiserver's version.
     pub kubernetes_version: String,
-    /// `k3s` or `rke2`, when the version names one.
+    /// `k3s`, `rke2` or `kubesolo`, when the version names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distribution: Option<String>,
     /// `1.34`.

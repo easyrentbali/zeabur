@@ -69,6 +69,7 @@ fn test_s3(dev: &DevCluster) -> Result<(), String> {
             Err(said.trim().to_owned())
         }
     })
+    .inspect_err(|_| dev.diagnose("s3-test"))
 }
 
 /// zot from Zeabur Builder's component, with the fixed ClusterIP the node's mirror points at.
@@ -79,7 +80,7 @@ fn zot(dev: &DevCluster) -> Result<(), String> {
         dev,
         "builds/zeabur-builder",
         "zot",
-        &[&format!("cluster-ip={ZOT_IP}")],
+        &[&format!("clusterIp={ZOT_IP}")],
         Some("builder"),
     )?;
     dev.kubectl()
@@ -91,7 +92,11 @@ fn zot(dev: &DevCluster) -> Result<(), String> {
             "--for=condition=Ready",
         ])
         .arg("--timeout=120s")
-        .quiet()?;
+        .quiet()
+        .inspect_err(|_| {
+            dev.diagnose("zot");
+            dev.diagnose("cert-manager");
+        })?;
     dev.rollout("zot", "statefulset/zot", Duration::from_secs(180))?;
     let ca = dev
         .kubectl()
@@ -193,12 +198,8 @@ fn builder(dev: &DevCluster, builder_src: Option<&Path>) -> Result<(), String> {
     ] {
         helm = helm.arg("--set").arg(value);
     }
-    helm.args([
-        "--set-json",
-        r#"extraArgs=["--buildkitd-host-users=false"]"#,
-    ])
-    .quiet()
-    .map_err(|e| format!("installing Zeabur Builder: {e}"))?;
+    helm.quiet()
+        .map_err(|e| format!("installing Zeabur Builder: {e}"))?;
     dev.rollout(
         "builder-system",
         "deployment/zeabur-builder",

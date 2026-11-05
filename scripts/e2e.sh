@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Zeabur in a cluster, end to end, on the development cluster (scripts/dev-cluster.sh: Zeabur
 # Identity and Zeabur from zeabur-installer's objects, behind Traefik over HTTPS): a browser
-# (web/e2e/l2) enrols a passkey, signs in, confirms a terminal with the passkey again, runs a
+# (web/e2e/full) enrols a passkey, signs in, confirms a terminal with the passkey again, runs a
 # command, then reads and changes with admin rights; an admin invites a Developer and a Viewer,
 # who each see what their role allows. Then, from the outside: Zeabur's service account can do
 # nothing a fresh one cannot, the idle pod stays within its memory budget, and removing Zeabur
@@ -9,18 +9,19 @@
 #
 # Run on Linux with Docker and Nix; it uses this machine's port 443. Arguments go to
 # `dev-cluster.sh up` (`--profile full`, `--identity-src <dir>`). The cluster is deleted at the
-# end; ZEABUR_L2_KEEP=1 keeps it, with Zeabur, and skips the removal check.
-#   scripts/e2e-l2.sh
+# end; ZEABUR_E2E_KEEP=1 keeps it, with Zeabur, and skips the removal check.
+#   scripts/e2e.sh
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ -z "${ZEABUR_CA_BUNDLE:-}" ]]; then
   exec nix develop "$root" --command "$0" "$@"
 fi
+source "$root/scripts/wait.sh"
+source "$root/scripts/idle-memory.sh"
 state="$root/target/dev-cluster"
 namespace=zeabur             # Zeabur's release
 project=zeabur-e2e           # the project the browser opens (web/e2e/manifests/talker.yaml)
-memory_budget=$((30 * 1024 * 1024))
 export KUBECONFIG="$state/kubeconfig"
 
 finish() {
@@ -34,7 +35,7 @@ finish() {
       [[ -f "$context" ]] && cat "$context" >&2
     done
   fi
-  [[ -n "${ZEABUR_L2_KEEP:-}" ]] || "$root/scripts/dev-cluster.sh" down
+  [[ -n "${ZEABUR_E2E_KEEP:-}" ]] || "$root/scripts/dev-cluster.sh" down
   exit "$status"
 }
 trap finish EXIT
@@ -42,8 +43,8 @@ trap finish EXIT
 "$root/scripts/dev-cluster.sh" up "$@"
 
 # --- The browser ----------------------------------------------------------------------------------
-# The e2e users, made from scratch, and web/e2e/l2.
-"$root/scripts/e2e-l2-browser.sh"
+# The e2e users, made from scratch, and web/e2e/full.
+"$root/scripts/e2e-browser.sh"
 # The restart the browser confirmed reached the cluster.
 restarted=$(kubectl -n "$project" get deployment/talker \
   -o jsonpath='{.spec.template.metadata.annotations.kubectl\.kubernetes\.io/restartedAt}')
@@ -117,30 +118,8 @@ out=$(admit Ingress "{\"rules\": [{\"host\": \"shop.localhost\", \"http\": $back
 echo "domains: the system namespaces keep theirs"
 
 # --- Memory when idle -----------------------------------------------------------------------------
-# The figure is the pod's working set as the kubelet reports it (Summary API, the one eviction
-# uses). Right after the cluster comes up it moves by tens of MB while the pod settles, so the
-# check waits a minute, then reads every 10 s for up to a minute more and passes on the first
-# reading within budget; it fails on the lowest reading when none is.
-pod=$(kubectl -n "$namespace" get pods -l app.kubernetes.io/name=zeabur -o jsonpath='{.items[0].metadata.name}')
-node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
-working_set_now() {
-  kubectl get --raw "/api/v1/nodes/$node_name/proxy/stats/summary" |
-    jq --arg ns "$namespace" --arg pod "$pod" \
-      '.pods[] | select(.podRef.namespace == $ns and .podRef.name == $pod) | .memory.workingSetBytes'
-}
-sleep 60
-working_set=
-for _ in 1 2 3 4 5 6 7; do
-  reading=$(working_set_now)
-  if [[ ! "$reading" =~ ^[0-9]+$ ]]; then
-    echo "error: the kubelet reported no working set for pod $pod" >&2
-    exit 1
-  fi
-  echo "idle working set: $reading bytes ($((reading / 1024)) KiB; budget $((memory_budget / 1024)) KiB)"
-  if [[ -z "$working_set" ]] || ((reading < working_set)); then working_set=$reading; fi
-  ((working_set <= memory_budget)) && break
-  sleep 10
-done
+# Of the `ci` build (scripts/build-image.sh); release-smoke.sh records the release build's.
+working_set=$(idle_working_set "$namespace")
 printf '{"pod_working_set_bytes": %s}\n' "$working_set" >"$state/measurements.json"
 if ((working_set > memory_budget)); then
   echo "error: idle working set $working_set bytes exceeds 30 MiB in every reading" >&2
@@ -148,20 +127,20 @@ if ((working_set > memory_budget)); then
 fi
 
 # --- Removal leaves the cluster as it was -----------------------------------------------------------
-[[ -z "${ZEABUR_L2_KEEP:-}" ]] || exit 0
+[[ -z "${ZEABUR_E2E_KEEP:-}" ]] || exit 0
 # As `zeabur-installer uninstall` removes Zeabur, and the values only this cluster sets.
-kubectl -n kube-system delete helmchart.helm.cattle.io zeabur --wait --timeout=180s
+wait_for kube-system kubectl -n kube-system delete helmchart.helm.cattle.io zeabur --wait --timeout=180s
 kubectl -n kube-system delete helmchartconfig.helm.cattle.io zeabur --wait
-kubectl delete namespace "$namespace" --wait --timeout=180s
-kubectl wait --for=delete namespace/zeabur-terminals --timeout=180s
+wait_for "$namespace" kubectl delete namespace "$namespace" --wait --timeout=180s
+wait_for zeabur-terminals kubectl wait --for=delete namespace/zeabur-terminals --timeout=180s
 kubectl delete rolebindings,clusterrolebindings -A -l app.kubernetes.io/managed-by=zeabur,zeabur.com/member --wait
 # The chart keeps the S3 destinations' namespace on purpose; the project's name is the person's.
-kubectl delete namespace zeabur-s3-destinations --wait --timeout=180s
+wait_for zeabur-s3-destinations kubectl delete namespace zeabur-s3-destinations --wait --timeout=180s
 kubectl annotate namespace "$project" zeabur.com/display-name-
 # Zeabur Builder keeps a buildkitd, with its cache volume, for every namespace that built something.
 # The project stays, so its builds' daemon goes here (full profile only).
 if kubectl get namespace builder-system >/dev/null 2>&1; then
-  kubectl -n builder-system delete statefulset "buildkitd-$project" --ignore-not-found --wait --timeout=180s
+  wait_for builder-system kubectl -n builder-system delete statefulset "buildkitd-$project" --ignore-not-found --wait --timeout=180s
 fi
 # A volume's PersistentVolume goes after its claim, when the provisioner has cleaned the disk.
 for _ in $(seq 36); do
