@@ -251,7 +251,7 @@ function InstallOne({
               {complete
                 ? "Installed and healthy"
                 : info.state === "external"
-                  ? "Already installed outside this dashboard"
+                  ? "Provided by an existing cluster component"
                   : info.state === "failed"
                     ? "Installation needs attention"
                     : info.state === "pending" || apply.isPending || attempted
@@ -260,7 +260,7 @@ function InstallOne({
                         ? "Ready to review"
                         : info.missingPrerequisites?.length
                           ? "Install required components"
-                          : "Installation needs attention"}
+                          : "Review installation requirements"}
             </p>
             {info.message ? <p className="mt-1 type-meta text-pretty">{info.message}</p> : null}
             {info.reasons.length > 0 ? (

@@ -227,15 +227,16 @@ pub(crate) async fn get(State(state): State<AppState>, Person(cluster): Person, 
         }
     }
     let installable = !inspect::has_blocking_reasons(&reasons) && current == "notInstalled";
+    let missing_prerequisites = inspect::missing_prerequisites(&guide, &zeabur_catalog::detect(&state.catalogue,&facts));
     let message = match current.as_str() {
         "installed" => "The Helm release is deployed and its workloads are healthy.",
         "pending" => "Installation is in progress. Submission is not readiness.",
         "failed" => "Installation failed or its workloads are unhealthy; existing resources were preserved.",
         "external" => "Existing resources are managed elsewhere. Dashboard installation will not take them over.",
         _ if installable => "Ready to preview a create-only installation.",
-        _ => "Installation prerequisites must be resolved before applying.",
+        _ if !missing_prerequisites.is_empty() => "Install the listed prerequisite components from this catalog, then check requirements again.",
+        _ => "Review the listed requirements before applying this component.",
     }.to_owned();
-    let missing_prerequisites = inspect::missing_prerequisites(&guide, &zeabur_catalog::detect(&state.catalogue,&facts));
     let mut result = ComponentInstallation { component:id, profiles:guide.profiles, inputs:guide.inputs, installable, reasons, missing_prerequisites, state:current, resources, message, continuation_token:None, phase:0, total_phases:1, resume_available:false };
     phases::progress(cluster.as_ref(),&state,&mut result).await?;
     Ok(Json(result))
