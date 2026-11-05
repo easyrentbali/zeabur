@@ -1022,6 +1022,28 @@ export type Component = {
 }
 
 /**
+ * A configured workload image and its version tag. Digest-only images stay explicitly pinned.
+ */
+export type RuntimeImage = {
+  /** Container name. */
+  container: string
+  /** Full image reference, including any immutable digest. */
+  image: string
+  /**
+   * Version tag if it is a version; absent for digest-only or unversioned tags.
+   * @nullable
+   */
+  version?: string | null
+  /**
+   * image-tag or workload-app-version (the latter only for a single-container workload).
+   * @nullable
+   */
+  versionSource?: string | null
+  /** Kind/namespace/name of the workload template this reference came from. */
+  workload: string
+}
+
+/**
  * How a component was installed.
  */
 export type InstallSource = (typeof InstallSource)[keyof typeof InstallSource]
@@ -1061,6 +1083,8 @@ export type Installation = {
    * @nullable
    */
   managedBy?: string | null
+  /** Configured workload images; separate from chart versions and chart upgrade comparisons. */
+  runtimeImages: RuntimeImage[]
   /** How it was installed. */
   source: InstallSource
   /**
@@ -3466,6 +3490,46 @@ export type ClusterUsage = {
    * @nullable
    */
   window?: string | null
+}
+
+/**
+ * A value the install needs from the person, or generates.
+ */
+export type InstallInput = {
+  /** What it is. */
+  description: string
+  /** It is generated at random, not asked for. */
+  generated: boolean
+  /** Its name, the `<name>` placeholder in the texts. */
+  name: string
+  /** It must be given. */
+  required: boolean
+}
+
+export type InstallResource = {
+  kind: string
+  name: string
+  namespace: string
+}
+
+export type ComponentInstallation = {
+  component: string
+  /** @nullable */
+  continuationToken?: string | null
+  inputs: InstallInput[]
+  installable: boolean
+  message: string
+  /** Missing catalogue component identifiers; install each using its own reviewed plan. */
+  missingPrerequisites: string[]
+  /** @minimum 0 */
+  phase: number
+  profiles: string[]
+  reasons: string[]
+  resources: InstallResource[]
+  resumeAvailable: boolean
+  state: string
+  /** @minimum 0 */
+  totalPhases: number
 }
 
 /**
@@ -6125,6 +6189,23 @@ export type InspectRequest = {
   registry?: RegistryLogin | null
 }
 
+export type InstallApplied = {
+  component: string
+  /** @nullable */
+  continuationToken?: string | null
+  message: string
+  /** @minimum 0 */
+  phase: number
+  state: string
+  /** @minimum 0 */
+  totalPhases: number
+  written: string[]
+}
+
+export type InstallApply = {
+  token: string
+}
+
 /**
  * How Zeabur was installed, which says how to upgrade it.
  */
@@ -6137,6 +6218,44 @@ export const InstallMethod = {
   flux: "flux",
   zeaburctl: "zeaburctl",
 } as const
+
+export type InstallPhase = {
+  /** @minimum 0 */
+  index: number
+  resources: InstallResource[]
+  title: string
+}
+
+export type InstallWrite = {
+  afterYaml: string
+  /** @nullable */
+  beforeYaml?: string | null
+  kind: string
+  name: string
+  namespace: string
+}
+
+export type InstallPlan = {
+  component: string
+  expiresAt: string
+  phases: InstallPhase[]
+  profile: string
+  token: string
+  warnings: string[]
+  writes: InstallWrite[]
+}
+
+export type InstallRequestInputs = { [key: string]: string }
+
+export type InstallRequest = {
+  component: string
+  inputs?: InstallRequestInputs
+  profile: string
+}
+
+export type InstallResumeRequest = {
+  component: string
+}
 
 /**
  * A pending one-time setup link. Its token is not kept anywhere: it can be revoked, not shown
@@ -10548,6 +10667,138 @@ export const listCapabilities = async (
   options?: Parameters<typeof zeaburFetch>[1],
 ): Promise<CapabilityList> => {
   return zeaburFetch<CapabilityList>(getListCapabilitiesUrl(), {
+    ...options,
+    method: "GET",
+  })
+}
+
+export const getApplyComponentInstallationUrl = () => {
+  return `/api/v1/cluster/components/install/apply`
+}
+
+/**
+ * @summary Apply once after fresh authorization, absence/UID/RV checks, and all feasible dry-runs.
+ */
+export const applyComponentInstallation = async (
+  installApply: InstallApply,
+  options?: Parameters<typeof zeaburFetch>[1],
+): Promise<InstallApplied> => {
+  const getHeaders = (
+    h?: NonNullable<RequestInit["headers"]>,
+  ): Record<string, string | readonly string[]> => {
+    if (!h) return {}
+    if (h instanceof Headers) return Object.fromEntries(h.entries())
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      )
+    }
+    const headers: Record<string, string | readonly string[]> = {}
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value
+    }
+    return headers
+  }
+  return zeaburFetch<InstallApplied>(getApplyComponentInstallationUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(installApply),
+  })
+}
+
+export const getPlanComponentInstallationUrl = () => {
+  return `/api/v1/cluster/components/install/plan`
+}
+
+/**
+ * @summary Read-only, identity-bound preview. Sensitive values only enter the encrypted token.
+ */
+export const planComponentInstallation = async (
+  installRequest: InstallRequest,
+  options?: Parameters<typeof zeaburFetch>[1],
+): Promise<InstallPlan> => {
+  const getHeaders = (
+    h?: NonNullable<RequestInit["headers"]>,
+  ): Record<string, string | readonly string[]> => {
+    if (!h) return {}
+    if (h instanceof Headers) return Object.fromEntries(h.entries())
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      )
+    }
+    const headers: Record<string, string | readonly string[]> = {}
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value
+    }
+    return headers
+  }
+  return zeaburFetch<InstallPlan>(getPlanComponentInstallationUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(installRequest),
+  })
+}
+
+export const getPlanComponentInstallationResumeUrl = () => {
+  return `/api/v1/cluster/components/install/resume-plan`
+}
+
+/**
+ * @summary Explicit read-only re-review of remaining phases after the original consent expires.
+ */
+export const planComponentInstallationResume = async (
+  installResumeRequest: InstallResumeRequest,
+  options?: Parameters<typeof zeaburFetch>[1],
+): Promise<InstallPlan> => {
+  const getHeaders = (
+    h?: NonNullable<RequestInit["headers"]>,
+  ): Record<string, string | readonly string[]> => {
+    if (!h) return {}
+    if (h instanceof Headers) return Object.fromEntries(h.entries())
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      )
+    }
+    const headers: Record<string, string | readonly string[]> = {}
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value
+    }
+    return headers
+  }
+  return zeaburFetch<InstallPlan>(getPlanComponentInstallationResumeUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(installResumeRequest),
+  })
+}
+
+export const getGetComponentInstallationUrl = (capability: string, component: string) => {
+  return `/api/v1/cluster/components/${encodeURIComponent(String(capability))}/${encodeURIComponent(String(component))}/installation`
+}
+
+/**
+ * @summary Installation eligibility and independently observed progress, without sensitive values.
+ */
+export const getComponentInstallation = async (
+  capability: string,
+  component: string,
+  options?: Parameters<typeof zeaburFetch>[1],
+): Promise<ComponentInstallation> => {
+  return zeaburFetch<ComponentInstallation>(getGetComponentInstallationUrl(capability, component), {
     ...options,
     method: "GET",
   })
