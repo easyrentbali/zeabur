@@ -11622,6 +11622,11 @@ components:
               The kubelet's filesystem (`nodefs`), where pods' logs, writable layers and `emptyDir`
               volumes live, from the metrics store; absent when the store has no value for this node.
           - type: "null"
+        displayName:
+          type:
+          - string
+          - "null"
+          description: The human-readable `erb.easyrentbali.com/display-name` annotation, when set.
         id:
           type: string
           description: "`cluster/nodes/<name>`."

@@ -6848,6 +6848,11 @@ export type NodeView = {
    */
   created?: string | null
   disk?: DiskUsage | null
+  /**
+   * The human-readable `erb.easyrentbali.com/display-name` annotation, when set.
+   * @nullable
+   */
+  displayName?: string | null
   /** `cluster/nodes/<name>`. */
   id: string
   /** The kernel version. */

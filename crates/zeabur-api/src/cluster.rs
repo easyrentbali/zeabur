@@ -290,6 +290,16 @@ pub(crate) fn roles(labels: Option<&BTreeMap<String, String>>) -> Vec<String> {
 /// A node, without the pods' sums.
 fn node_view(node: &Node) -> NodeView {
     let name = node.metadata.name.clone().unwrap_or_default();
+    let display_name = node
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("erb.easyrentbali.com/display-name"))
+        .map(|value| value.trim())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned);
     let status = node.status.as_ref();
     let conditions = status.and_then(|s| s.conditions.as_ref());
     let ready = conditions
@@ -328,6 +338,7 @@ fn node_view(node: &Node) -> NodeView {
         id: format!("cluster/nodes/{name}"),
         origin: Origin::complete("v1", "Node", None, &name),
         name,
+        display_name,
         roles: roles(node.metadata.labels.as_ref()),
         ready,
         problems,
@@ -757,6 +768,44 @@ pub(crate) async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_display_name_preserves_its_identity() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": "hostdzire-worker-1",
+                "annotations": {"erb.easyrentbali.com/display-name": " HDZ-NL-worker-1 "}
+            }
+        }))
+        .unwrap();
+        let view = serde_json::to_value(node_view(&node)).unwrap();
+        assert_eq!(view["displayName"], "HDZ-NL-worker-1");
+        assert_eq!(view["name"], "hostdzire-worker-1");
+        assert_eq!(view["id"], "cluster/nodes/hostdzire-worker-1");
+        assert_eq!(view["origin"]["name"], "hostdzire-worker-1");
+    }
+
+    #[test]
+    fn invalid_node_display_names_are_omitted() {
+        for value in [
+            String::new(),
+            " \t ".to_owned(),
+            "a\nb".to_owned(),
+            "x".repeat(129),
+        ] {
+            let node: Node = serde_json::from_value(serde_json::json!({
+                "metadata": {
+                    "name": "hostdzire-worker-1",
+                    "annotations": {"erb.easyrentbali.com/display-name": value}
+                }
+            }))
+            .unwrap();
+            let view = serde_json::to_value(node_view(&node)).unwrap();
+            assert!(view.get("displayName").is_none());
+            assert_eq!(view["name"], "hostdzire-worker-1");
+        }
+        assert!(node_view(&Node::default()).display_name.is_none());
+    }
 
     #[test]
     fn roles_come_from_labels_and_master_is_control_plane() {

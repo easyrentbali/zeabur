@@ -467,6 +467,9 @@ pub struct NodeView {
     pub origin: Origin,
     /// Its name.
     pub name: String,
+    /// The human-readable `erb.easyrentbali.com/display-name` annotation, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Its roles (`control-plane`, `etcd`, …), from `node-role.kubernetes.io/<role>` labels;
     /// empty for a plain worker.
     pub roles: Vec<String>,
