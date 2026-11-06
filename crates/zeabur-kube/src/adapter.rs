@@ -900,6 +900,47 @@ fn chart_versions(charts: &[DynamicObject]) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn workload_images(
+    value: &serde_json::Value,
+    kind: &str,
+) -> Result<crate::WorkloadImages, ClusterError> {
+    let metadata = value.get("metadata").cloned().unwrap_or_default();
+    Ok(crate::WorkloadImages {
+        kind: kind.to_owned(),
+        namespace: metadata["namespace"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        name: metadata["name"].as_str().unwrap_or_default().to_owned(),
+        labels: serde_json::from_value(
+            metadata
+                .get("labels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .map_err(|e| ClusterError::Decode(e.to_string()))?,
+        template_labels: serde_json::from_value(
+            value
+                .pointer("/spec/template/metadata/labels")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .map_err(|e| ClusterError::Decode(e.to_string()))?,
+        images: value
+            .pointer("/spec/template/spec/containers")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some((
+                    c["name"].as_str()?.to_owned(),
+                    c["image"].as_str()?.to_owned(),
+                ))
+            })
+            .collect(),
+    })
+}
+
 /// Retain only image references and metadata from workload reads, never environment values.
 async fn list_workload_images<T>(
     api: Api<T>,
@@ -916,34 +957,7 @@ where
             .map(|item| {
                 let value =
                     serde_json::to_value(item).map_err(|e| ClusterError::Decode(e.to_string()))?;
-                let metadata = value.get("metadata").cloned().unwrap_or_default();
-                Ok(crate::WorkloadImages {
-                    kind: kind.to_owned(),
-                    namespace: metadata["namespace"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                    name: metadata["name"].as_str().unwrap_or_default().to_owned(),
-                    labels: serde_json::from_value(
-                        metadata
-                            .get("labels")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!({})),
-                    )
-                    .map_err(|e| ClusterError::Decode(e.to_string()))?,
-                    images: value
-                        .pointer("/spec/template/spec/containers")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|c| {
-                            Some((
-                                c["name"].as_str()?.to_owned(),
-                                c["image"].as_str()?.to_owned(),
-                            ))
-                        })
-                        .collect(),
-                })
+                workload_images(&value, kind)
             })
             .collect::<Result<Vec<_>, ClusterError>>()
             .map(Listed::Items),
@@ -1003,6 +1017,34 @@ async fn releases_and_workloads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_images_keep_template_labels_separate_from_detection_labels() {
+        let value = serde_json::json!({
+            "metadata": {"namespace": "system-upgrade", "name": "system-upgrade-controller"},
+            "spec": {"template": {
+                "metadata": {"labels": {"upgrade.cattle.io/controller": "system-upgrade-controller"}},
+                "spec": {"containers": [{
+                    "name": "controller", "image": "rancher/system-upgrade-controller:v0.21.0",
+                    "env": [{"name": "PRIVATE_SETTING", "value": "must-not-be-retained"}]
+                }]}
+            }}
+        });
+        let images = workload_images(&value, "Deployment").unwrap();
+        assert!(images.labels.is_empty());
+        assert_eq!(
+            images
+                .template_labels
+                .get("upgrade.cattle.io/controller")
+                .map(String::as_str),
+            Some("system-upgrade-controller")
+        );
+        assert_eq!(
+            images.images.get("controller").map(String::as_str),
+            Some("rancher/system-upgrade-controller:v0.21.0")
+        );
+        assert!(!format!("{images:?}").contains("must-not-be-retained"));
+    }
 
     #[test]
     fn only_charts_rke2_marks_as_its_own_count_as_rke2_packaged() {

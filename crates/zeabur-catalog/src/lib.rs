@@ -329,7 +329,13 @@ pub fn detect(components: &[Component], facts: &ClusterFacts) -> Vec<Capability>
                 components: Vec::new(),
                 installations: Vec::new(),
             });
-        let evidence = evidence(&component.detection, facts);
+        let mut evidence = evidence(&component.detection, facts);
+        if component.capability == "logs"
+            && component.id == "victoria-logs"
+            && facts.workload_images.iter().any(legacy_logs_store)
+        {
+            evidence.push("Legacy log backend StatefulSet zeabur-system/victoria-logs".to_owned());
+        }
         capability.existing |= !evidence.is_empty();
         if !evidence.is_empty() {
             capability.installations.push(installed::installation(
@@ -352,6 +358,26 @@ pub fn detect(components: &[Component], facts: &ClusterFacts) -> Vec<Capability>
         }
     }
     capabilities
+}
+
+fn legacy_logs_store(workload: &zeabur_kube::WorkloadImages) -> bool {
+    workload.kind == "StatefulSet"
+        && workload.namespace == "zeabur-system"
+        && workload.name == "victoria-logs"
+        && [
+            ("app.kubernetes.io/name", "victoria-logs"),
+            ("app.kubernetes.io/component", "server"),
+            ("app.kubernetes.io/managed-by", "zeabur-operator"),
+            ("app.kubernetes.io/part-of", "zeabur-logs"),
+        ]
+        .iter()
+        .all(|(key, value)| workload.labels.get(*key).map(String::as_str) == Some(*value))
+        && workload.images.values().any(|image| {
+            matches!(
+                image.split([':', '@']).next(),
+                Some("victoriametrics/victoria-logs" | "docker.io/victoriametrics/victoria-logs")
+            )
+        })
 }
 
 /// Everything in `facts` that matches `detection`.
@@ -501,6 +527,90 @@ mod tests {
             BTreeMap::from([("k8s-app".to_owned(), "metrics-server".to_owned())]),
         ));
         facts
+    }
+
+    #[test]
+    fn legacy_zeabur_logs_requires_the_known_store_identity() {
+        let components = catalogue().unwrap();
+        let store = zeabur_kube::WorkloadImages {
+            kind: "StatefulSet".to_owned(),
+            namespace: "zeabur-system".to_owned(),
+            name: "victoria-logs".to_owned(),
+            labels: [
+                (
+                    "app.kubernetes.io/name".to_owned(),
+                    "victoria-logs".to_owned(),
+                ),
+                (
+                    "app.kubernetes.io/component".to_owned(),
+                    "server".to_owned(),
+                ),
+                (
+                    "app.kubernetes.io/managed-by".to_owned(),
+                    "zeabur-operator".to_owned(),
+                ),
+                (
+                    "app.kubernetes.io/part-of".to_owned(),
+                    "zeabur-logs".to_owned(),
+                ),
+            ]
+            .into(),
+            images: [(
+                "victoria-logs".to_owned(),
+                "docker.io/victoriametrics/victoria-logs:v1.52.0".to_owned(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let logs = |store| {
+            detect(
+                &components,
+                &ClusterFacts {
+                    workload_images: vec![store],
+                    ..Default::default()
+                },
+            )
+            .into_iter()
+            .find(|c| c.name == "logs")
+            .unwrap()
+        };
+        let found = logs(store.clone());
+        assert!(found.existing);
+        assert!(
+            found
+                .evidence
+                .iter()
+                .any(|e| e.contains("zeabur-system/victoria-logs"))
+        );
+        assert_eq!(found.installations.len(), 1);
+        assert_eq!(
+            found.installations[0].runtime_images[0].version.as_deref(),
+            Some("1.52.0")
+        );
+        assert!(found.installations[0].version.is_none());
+
+        let mut cases = Vec::new();
+        let mut wrong = store.clone();
+        wrong.kind = "Deployment".to_owned();
+        cases.push(wrong);
+        let mut wrong = store.clone();
+        wrong.namespace = "another-project".to_owned();
+        cases.push(wrong);
+        let mut wrong = store.clone();
+        wrong.name = "another-store".to_owned();
+        cases.push(wrong);
+        let mut wrong = store.clone();
+        wrong.labels.remove("app.kubernetes.io/managed-by");
+        cases.push(wrong);
+        let mut wrong = store;
+        wrong.images.insert(
+            "victoria-logs".to_owned(),
+            "example.test/unrelated:v1.52.0".to_owned(),
+        );
+        cases.push(wrong);
+        for wrong in cases {
+            assert!(!logs(wrong).existing);
+        }
     }
 
     #[test]

@@ -168,27 +168,28 @@ fn image_version(image: &str) -> Option<String> {
 fn runtime_images(component: &Component, facts: &ClusterFacts) -> Vec<RuntimeImage> {
     let mut images = Vec::new();
     for workload in &facts.workload_images {
+        let mut labels = workload.template_labels.clone();
+        labels.extend(workload.labels.clone());
         let matches = component.detection.workloads.iter().any(|m| {
             m.kind == workload.kind
                 && m.labels
                     .iter()
-                    .all(|(key, value)| workload.labels.get(key) == Some(value))
+                    .all(|(key, value)| labels.get(key) == Some(value))
         }) || component.detection.helm_charts.iter().any(|chart| {
-            workload
-                .labels
+            labels
                 .get("helm.sh/chart")
                 .and_then(|label| label.strip_prefix(chart.as_str()))
                 .is_some_and(|rest| rest.starts_with('-'))
         }) || ["app.kubernetes.io/name", "app"]
             .iter()
-            .any(|key| workload.labels.get(*key) == Some(&component.id));
+            .any(|key| labels.get(*key) == Some(&component.id));
         if !matches {
             continue;
         }
         for (container, image) in &workload.images {
             let image_tag = image_version(image);
             let declared = (workload.images.len() == 1)
-                .then(|| workload.labels.get("app.kubernetes.io/version"))
+                .then(|| labels.get("app.kubernetes.io/version"))
                 .flatten()
                 .filter(|v| semver(v).is_some())
                 .cloned();
@@ -306,6 +307,7 @@ mod tests {
             namespace: "platform-system".to_owned(),
             name: "erb-traefik".to_owned(),
             labels: [("helm.sh/chart".to_owned(), "traefik-42.3.0".to_owned())].into(),
+            template_labels: Default::default(),
             images: [(
                 "traefik".to_owned(),
                 "docker.io/traefik:v3.7.17@sha256:fixture".to_owned(),
@@ -322,6 +324,46 @@ mod tests {
     }
 
     #[test]
+    fn a_controller_with_only_template_labels_exposes_its_runtime_version() {
+        let mut facts = ClusterFacts::default();
+        facts.workload_images.push(zeabur_kube::WorkloadImages {
+            kind: "Deployment".to_owned(),
+            namespace: "system-upgrade".to_owned(),
+            name: "system-upgrade-controller".to_owned(),
+            template_labels: [(
+                "upgrade.cattle.io/controller".to_owned(),
+                "system-upgrade-controller".to_owned(),
+            )]
+            .into(),
+            images: [(
+                "system-upgrade-controller".to_owned(),
+                "rancher/system-upgrade-controller:v0.21.0@sha256:fixture".to_owned(),
+            )]
+            .into(),
+            ..Default::default()
+        });
+        let found = installation(&component("system-upgrade-controller"), &facts, None);
+        assert_eq!(found.runtime_images.len(), 1);
+        assert_eq!(found.runtime_images[0].version.as_deref(), Some("0.21.0"));
+        assert_eq!(
+            found.runtime_images[0].version_source.as_deref(),
+            Some("image-tag")
+        );
+        assert_eq!(found.version, None);
+        assert_eq!(found.upgrade, None);
+
+        facts.workload_images[0].labels.insert(
+            "upgrade.cattle.io/controller".to_owned(),
+            "another-controller".to_owned(),
+        );
+        assert!(
+            installation(&component("system-upgrade-controller"), &facts, None)
+                .runtime_images
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn raw_controller_versions_do_not_invent_chart_comparisons() {
         let mut facts = ClusterFacts::default();
         facts.workload_images.push(zeabur_kube::WorkloadImages {
@@ -333,6 +375,7 @@ mod tests {
                 "cert-manager".to_owned(),
             )]
             .into(),
+            template_labels: Default::default(),
             images: [(
                 "cert-manager".to_owned(),
                 "quay.io/jetstack/cert-manager-controller:v1.21.3".to_owned(),
@@ -363,6 +406,7 @@ mod tests {
                 ("app.kubernetes.io/version".to_owned(), "3.7.17".to_owned()),
             ]
             .into(),
+            template_labels: Default::default(),
             images: [("traefik".to_owned(), "traefik@sha256:fixture".to_owned())].into(),
         });
         let found = installation(&component("traefik"), &facts, None);

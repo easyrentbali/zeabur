@@ -662,6 +662,8 @@ pub struct WorkloadImages {
     pub name: String,
     /// Metadata labels used by catalogue detection.
     pub labels: BTreeMap<String, String>,
+    /// Pod template labels used to associate runtime images with a component.
+    pub template_labels: BTreeMap<String, String>,
     /// Container name to configured image reference.
     pub images: BTreeMap<String, String>,
 }
