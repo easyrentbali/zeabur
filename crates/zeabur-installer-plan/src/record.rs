@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::PlanError;
 use crate::catalog::Index;
-use crate::plan::{ComponentPlan, ReleasePlan, Warning, warning};
+use crate::plan::{ComponentPlan, IdentityPlan, ReleasePlan, ZeaburPlan};
 
 /// This installer's version.
 pub const INSTALLER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -33,6 +33,14 @@ pub struct Record {
     pub values: BTreeMap<(String, String), String>,
     /// The components with a `HelmChart` release, which `apply` uninstalls when they leave.
     pub helm: BTreeSet<String>,
+    /// Zeabur Identity's issuer, `https://<identity>`.
+    pub identity: Option<String>,
+    /// Zeabur's URL.
+    pub zeabur: Option<String>,
+    /// Zeabur Identity's release; `None` from an older installer or a development source.
+    pub identity_version: Option<String>,
+    /// Zeabur's release; `None` from an older installer or a development source.
+    pub zeabur_version: Option<String>,
 }
 
 impl Record {
@@ -88,12 +96,26 @@ impl Record {
         Some(Self {
             installer: text("installer").unwrap_or_default().to_owned(),
             components,
-            version: text("version")
-                .or_else(|| text("kubesolo"))
-                .map(str::to_owned),
+            version: text("version").map(str::to_owned),
             charts,
             values,
             helm,
+            identity: plan
+                .pointer("/identity/issuer")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            zeabur: plan
+                .pointer("/zeabur/url")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            identity_version: plan
+                .pointer("/identity/version")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            zeabur_version: plan
+                .pointer("/zeabur/version")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -130,8 +152,7 @@ pub struct Changes {
     pub installer: String,
     /// Components it installs that the record does not have.
     pub added: Vec<String>,
-    /// Recorded components it no longer plans and uninstalls, and old ids whose new component it
-    /// installs.
+    /// Recorded components it no longer plans and uninstalls.
     pub removed: Vec<String>,
     /// Recorded components it no longer plans that have no chart to uninstall; what they
     /// installed keeps running.
@@ -140,6 +161,10 @@ pub struct Changes {
     pub charts: Vec<ChartChange>,
     /// The K3s, RKE2 or `KubeSolo` release, when it changes.
     pub version: Option<VersionChange>,
+    /// Zeabur Identity's or Zeabur's URL, when the access domains change.
+    pub urls: Vec<UrlChange>,
+    /// Zeabur Identity's or Zeabur's release, when it changes.
+    pub products: Vec<ProductChange>,
     /// Host files whose content changes; `apply` fills it.
     pub host_files: Vec<String>,
     /// `apply` restarts K3s, RKE2 or `KubeSolo`.
@@ -162,6 +187,41 @@ pub struct ChartChange {
     pub values: bool,
 }
 
+/// A URL that changes: certificates are issued again and sign-in moves to the new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UrlChange {
+    /// What the URL is for, as `plan` names it.
+    pub name: String,
+    /// The recorded URL.
+    pub from: String,
+    /// The planned URL.
+    pub to: String,
+}
+
+/// Zeabur Identity's or Zeabur's release that `apply` installs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProductChange {
+    /// `Zeabur Identity` or `Zeabur`.
+    pub name: String,
+    /// The recorded release; `None` when an older installer wrote the record.
+    pub from: Option<String>,
+    /// The planned release.
+    pub to: String,
+}
+
+/// What a plan installs, to compare with the record.
+#[derive(Debug, Clone, Copy)]
+pub struct Planned<'a> {
+    /// The components.
+    pub components: &'a [ComponentPlan],
+    /// The K3s, RKE2 or `KubeSolo` release.
+    pub version: &'a str,
+    /// Zeabur Identity; `None` when the plan has none.
+    pub identity: Option<&'a IdentityPlan>,
+    /// Zeabur; `None` when the plan has none.
+    pub zeabur: Option<&'a ZeaburPlan>,
+}
+
 /// A release that changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VersionChange {
@@ -172,79 +232,49 @@ pub struct VersionChange {
 }
 
 impl Changes {
-    /// The changes of a plan with `components` and the `version` release.
+    /// The changes `planned` makes against `record`.
     ///
     /// A left-out component counts as removed only when `apply` uninstalls it: it has a chart and
     /// `index` still knows it, as [`crate::remove::removals`] requires.
     #[must_use]
-    pub fn new(
-        record: &Record,
-        index: &Index,
-        components: &[ComponentPlan],
-        version: &str,
-    ) -> Self {
-        let planned: BTreeSet<&str> = components.iter().map(|c| c.id.as_str()).collect();
-        let mut charts = Vec::new();
-        for component in components {
-            for release in &component.releases {
-                let ReleasePlan::HelmChart { name, object, .. } = release else {
-                    continue;
-                };
-                let key = (component.id.clone(), name.clone());
-                let Some(from) = record.charts.get(&key) else {
-                    continue;
-                };
-                let Some(to) = object.pointer("/spec/version").and_then(Value::as_str) else {
-                    continue;
-                };
-                let values_changed = record.values.get(&key).is_some_and(|recorded| {
-                    object
-                        .pointer("/spec/valuesContent")
-                        .and_then(Value::as_str)
-                        .is_some_and(|planned| planned != recorded)
-                });
-                if from != to || values_changed {
-                    charts.push(ChartChange {
-                        component: component.id.clone(),
-                        release: name.clone(),
-                        from: from.clone(),
-                        to: to.to_owned(),
-                        values: values_changed,
-                    });
-                }
+    pub fn new(record: &Record, index: &Index, planned: Planned<'_>) -> Self {
+        let ids: BTreeSet<&str> = planned.components.iter().map(|c| c.id.as_str()).collect();
+        let mut added = Vec::new();
+        for component in planned.components {
+            if !record.components.contains(&component.id) {
+                added.push(component.id.clone());
             }
         }
-        let (removed, kept) = record
-            .components
-            .iter()
-            .filter(|id| !planned.contains(id.as_str()))
-            .cloned()
-            .partition(|id| {
-                record.helm.contains(id) && index.component(id).is_some()
-                    || index
-                        .replacement_of(id)
-                        .is_some_and(|new| planned.contains(new))
-            });
+        let mut removed = Vec::new();
+        let mut kept = Vec::new();
+        for id in &record.components {
+            if ids.contains(id.as_str()) {
+                continue;
+            }
+            if record.helm.contains(id) && index.component(id).is_some() {
+                removed.push(id.clone());
+            } else {
+                kept.push(id.clone());
+            }
+        }
         let version = record
             .version
             .as_ref()
-            .filter(|from| *from != version)
+            .filter(|from| *from != planned.version)
             .map(|from| VersionChange {
                 from: from.clone(),
-                to: version.to_owned(),
+                to: planned.version.to_owned(),
             });
         Self {
             installer: record.installer.clone(),
-            added: components
-                .iter()
-                .filter(|c| !record.components.contains(&c.id))
-                .map(|c| c.id.clone())
-                .collect(),
+            added,
             removed,
             kept,
-            charts,
+            charts: chart_changes(record, planned.components),
             restart: version.is_some(),
             version,
+            urls: url_changes(record, planned),
+            products: product_changes(record, planned),
             host_files: Vec::new(),
         }
     }
@@ -256,70 +286,109 @@ impl Changes {
     }
 }
 
-/// Warns that Zeabur Builder deletes images when `apply` installs it on a server that has zot.
-#[must_use]
-pub fn builder_deletes_images(record: &Record, components: &[ComponentPlan]) -> Option<Warning> {
-    const ZOT: &str = "container-registry/zot";
-    const BUILDER: &str = "builds/zeabur-builder";
-    (record.components.contains(ZOT)
-        && !record.components.contains(BUILDER)
-        && components.iter().any(|c| c.id == BUILDER))
-    .then(|| {
-        warning(
-            "builder.deletesImages",
-            &[],
-            "Zeabur Builder takes over zot and deletes images under <project>/<name> paths that \
-             no build made, including any you pushed there yourself. To keep every image: \
-             disable: [builds/zeabur-builder]"
-                .to_owned(),
-        )
-    })
+/// The planned charts whose version or values differ from the recorded ones.
+fn chart_changes(record: &Record, components: &[ComponentPlan]) -> Vec<ChartChange> {
+    let mut charts = Vec::new();
+    for component in components {
+        for release in &component.releases {
+            let ReleasePlan::HelmChart { name, object, .. } = release else {
+                continue;
+            };
+            let key = (component.id.clone(), name.clone());
+            let Some(from) = record.charts.get(&key) else {
+                continue;
+            };
+            let Some(to) = object.pointer("/spec/version").and_then(Value::as_str) else {
+                continue;
+            };
+            let values_changed = record.values.get(&key).is_some_and(|recorded| {
+                object
+                    .pointer("/spec/valuesContent")
+                    .and_then(Value::as_str)
+                    .is_some_and(|planned| planned != recorded)
+            });
+            if from != to || values_changed {
+                charts.push(ChartChange {
+                    component: component.id.clone(),
+                    release: name.clone(),
+                    from: from.clone(),
+                    to: to.to_owned(),
+                    values: values_changed,
+                });
+            }
+        }
+    }
+    charts
+}
+
+/// Zeabur Identity's and Zeabur's URLs, when both the record and the plan have one and they
+/// differ.
+fn url_changes(record: &Record, planned: Planned<'_>) -> Vec<UrlChange> {
+    let pairs = [
+        (
+            "Zeabur Identity",
+            record.identity.as_deref(),
+            planned.identity.map(|i| i.issuer.as_str()),
+        ),
+        (
+            "Zeabur",
+            record.zeabur.as_deref(),
+            planned.zeabur.map(|z| z.url.as_str()),
+        ),
+    ];
+    let mut urls = Vec::new();
+    for (name, from, to) in pairs {
+        if let (Some(from), Some(to)) = (from, to)
+            && from != to
+        {
+            urls.push(UrlChange {
+                name: name.to_owned(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+            });
+        }
+    }
+    urls
+}
+
+/// Zeabur Identity's and Zeabur's releases, when the plan pins one the record doesn't have.
+fn product_changes(record: &Record, planned: Planned<'_>) -> Vec<ProductChange> {
+    let pairs = [
+        (
+            "Zeabur Identity",
+            record.identity_version.as_ref(),
+            planned.identity.and_then(|i| i.version.as_ref()),
+        ),
+        (
+            "Zeabur",
+            record.zeabur_version.as_ref(),
+            planned.zeabur.and_then(|z| z.version.as_ref()),
+        ),
+    ];
+    let mut products = Vec::new();
+    for (name, from, to) in pairs {
+        let Some(to) = to else {
+            continue;
+        };
+        if from == Some(to) {
+            continue;
+        }
+        products.push(ProductChange {
+            name: name.to_owned(),
+            from: from.cloned(),
+            to: to.clone(),
+        });
+    }
+    products
 }
 
 /// The precedence of two versions as Semantic Versioning 2.0.0 orders them
 /// (<https://semver.org/#spec-item-11>); `None` when either is not one.
 #[must_use]
 pub fn precedence(a: &str, b: &str) -> Option<Ordering> {
-    let (a_core, a_pre) = parts(a)?;
-    let (b_core, b_pre) = parts(b)?;
-    Some(a_core.cmp(&b_core).then_with(|| {
-        match (a_pre.is_empty(), b_pre.is_empty()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => a_pre
-                .iter()
-                .zip(&b_pre)
-                .map(|(x, y)| identifier(x, y))
-                .find(|o| o.is_ne())
-                .unwrap_or_else(|| a_pre.len().cmp(&b_pre.len())),
-        }
-    }))
-}
-
-fn parts(version: &str) -> Option<([u64; 3], Vec<&str>)> {
-    let version = version.split_once('+').map_or(version, |(v, _)| v);
-    let (core, pre) = version.split_once('-').unwrap_or((version, ""));
-    let mut numbers = core.split('.').map(|n| n.parse::<u64>().ok());
-    let core = [numbers.next()??, numbers.next()??, numbers.next()??];
-    if numbers.next().is_some() {
-        return None;
-    }
-    let pre = if pre.is_empty() {
-        Vec::new()
-    } else {
-        pre.split('.').collect()
-    };
-    Some((core, pre))
-}
-
-fn identifier(a: &str, b: &str) -> Ordering {
-    match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(x), Ok(y)) => x.cmp(&y),
-        (Ok(_), Err(_)) => Ordering::Less,
-        (Err(_), Ok(_)) => Ordering::Greater,
-        (Err(_), Err(_)) => a.cmp(b),
-    }
+    let a = semver::Version::parse(a).ok()?;
+    let b = semver::Version::parse(b).ok()?;
+    Some(a.cmp_precedence(&b))
 }
 
 #[cfg(test)]
@@ -358,6 +427,10 @@ mod tests {
             charts: BTreeMap::new(),
             values: BTreeMap::new(),
             helm: BTreeSet::new(),
+            identity: None,
+            zeabur: None,
+            identity_version: None,
+            zeabur_version: None,
         };
         let error = record.check_installer().unwrap_err().to_string();
         assert!(

@@ -55,6 +55,7 @@ pub mod backup_download;
 pub mod backups;
 pub(crate) mod capacity;
 pub mod config_reload;
+pub mod component_install;
 pub(crate) mod disks;
 pub mod github_app;
 pub(crate) mod health;
@@ -109,6 +110,8 @@ fn distribution(version: &str) -> Option<String> {
         Some("k3s".to_owned())
     } else if version.contains("+rke2") {
         Some("rke2".to_owned())
+    } else if version.contains("+kubesolo") {
+        Some("kubesolo".to_owned())
     } else {
         None
     }
@@ -287,6 +290,16 @@ pub(crate) fn roles(labels: Option<&BTreeMap<String, String>>) -> Vec<String> {
 /// A node, without the pods' sums.
 fn node_view(node: &Node) -> NodeView {
     let name = node.metadata.name.clone().unwrap_or_default();
+    let display_name = node
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("erb.easyrentbali.com/display-name"))
+        .map(|value| value.trim())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned);
     let status = node.status.as_ref();
     let conditions = status.and_then(|s| s.conditions.as_ref());
     let ready = conditions
@@ -325,6 +338,7 @@ fn node_view(node: &Node) -> NodeView {
         id: format!("cluster/nodes/{name}"),
         origin: Origin::complete("v1", "Node", None, &name),
         name,
+        display_name,
         roles: roles(node.metadata.labels.as_ref()),
         ready,
         problems,
@@ -756,6 +770,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_node_display_name_preserves_its_identity() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": "hostdzire-worker-1",
+                "annotations": {"erb.easyrentbali.com/display-name": " HDZ-NL-worker-1 "}
+            }
+        }))
+        .unwrap();
+        let view = serde_json::to_value(node_view(&node)).unwrap();
+        assert_eq!(view["displayName"], "HDZ-NL-worker-1");
+        assert_eq!(view["name"], "hostdzire-worker-1");
+        assert_eq!(view["id"], "cluster/nodes/hostdzire-worker-1");
+        assert_eq!(view["origin"]["name"], "hostdzire-worker-1");
+    }
+
+    #[test]
+    fn invalid_node_display_names_are_omitted() {
+        for value in [
+            String::new(),
+            " \t ".to_owned(),
+            "a\nb".to_owned(),
+            "x".repeat(129),
+        ] {
+            let node: Node = serde_json::from_value(serde_json::json!({
+                "metadata": {
+                    "name": "hostdzire-worker-1",
+                    "annotations": {"erb.easyrentbali.com/display-name": value}
+                }
+            }))
+            .unwrap();
+            let view = serde_json::to_value(node_view(&node)).unwrap();
+            assert!(view.get("displayName").is_none());
+            assert_eq!(view["name"], "hostdzire-worker-1");
+        }
+        assert!(node_view(&Node::default()).display_name.is_none());
+    }
+
+    #[test]
     fn roles_come_from_labels_and_master_is_control_plane() {
         let labels = BTreeMap::from([
             (
@@ -771,5 +823,16 @@ mod tests {
         ]);
         assert_eq!(roles(Some(&labels)), ["control-plane", "etcd"]);
         assert_eq!(roles(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_version_names_the_distribution() {
+        assert_eq!(distribution("v1.36.5+k3s1").as_deref(), Some("k3s"));
+        assert_eq!(distribution("v1.36.5+rke2r1").as_deref(), Some("rke2"));
+        assert_eq!(
+            distribution("v1.35.7+kubesolo-v1.2.3").as_deref(),
+            Some("kubesolo")
+        );
+        assert_eq!(distribution("v1.36.2"), None);
     }
 }

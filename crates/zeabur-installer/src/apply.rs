@@ -13,13 +13,13 @@ use zeabur_installer_host::nodeprep::{self, Stage};
 use zeabur_installer_host::preflight::{self, Status};
 use zeabur_installer_host::{archive, chart, cmd, download, facts, files, systemd};
 use zeabur_installer_plan::catalog::{Encoding, Index};
-use zeabur_installer_plan::cluster::{AUTHN_CONFIGMAP, Distribution, HostFile};
+use zeabur_installer_plan::cluster::{APPARMOR_PROFILE, AUTHN_CONFIGMAP, Distribution, HostFile};
 use zeabur_installer_plan::config::{AccessMode, Config};
 use zeabur_installer_plan::k3s;
 use zeabur_installer_plan::plan::{
     self, ClusterPlan, ComponentPlan, Download, IDENTITY_NAMESPACE, IdentityPlan, LOCAL_ISSUER,
-    MANAGER, NAMESPACE_MANAGER, Plan, RegistryPlan, ReleasePlan, SecretRefPlan, SecretSource,
-    Source, ZEABUR_NAMESPACE, ZeaburPlan,
+    MANAGER, NAMESPACE_MANAGER, NodeWaiting, Plan, RegistryPlan, ReleasePlan, SecretRefPlan,
+    SecretSource, Source, ZEABUR_NAMESPACE, ZeaburPlan,
 };
 use zeabur_installer_plan::record::{INSTALLER_FILE, INSTALLER_VERSION, Record};
 use zeabur_installer_plan::rke2::{ETCD_USER, PREFIX};
@@ -27,7 +27,7 @@ use zeabur_installer_plan::storage::{self, NodePrep, Storage};
 use zeabur_telemetry::{InstallationId, Step};
 
 use crate::telemetry::{self, Reporter};
-use crate::{InstallError, load, out, remove, render};
+use crate::{InstallError, doctor, load, out, remove, render};
 
 /// Downloads and the local CA's copy.
 pub(crate) const STATE_DIR: &str = "/var/lib/rancher/zeabur-installer";
@@ -92,7 +92,7 @@ fn install(config: &Config, reporter: &Reporter) -> Result<(), InstallError> {
 
     reporter.at(Step::ClusterSetup);
     out::step("Namespaces and network policies");
-    let nodes = node_addresses(&kubectl)?;
+    let nodes = node_addresses(&kubectl, distribution, NODE_ADDRESS_WAIT)?;
     for namespace in &plan.namespaces {
         kubectl.apply_as(
             NAMESPACE_MANAGER,
@@ -157,7 +157,7 @@ fn install_components(kubectl: &Kubectl, plan: &Plan) -> Result<(), InstallError
         }
         releases(kubectl, component)?;
         for check in &component.health {
-            kubectl.wait(&check.args("--timeout=5m"))?;
+            doctor::wait_health(check, "--timeout=5m", |args| kubectl.wait(args))?;
         }
         if let Some(registry) = plan
             .registry
@@ -176,6 +176,7 @@ fn install_components(kubectl: &Kubectl, plan: &Plan) -> Result<(), InstallError
 
 /// The plan, with the install record and the removals read from the cluster when it runs.
 pub(crate) fn make_plan(index: &Index, config: &Config) -> Result<Plan, InstallError> {
+    load::sources(&config.sources)?;
     let kubectl = Kubectl::admin(config.distribution);
     let running = systemd::is_active(config.distribution.server_unit());
     let mut facts = facts::read()?;
@@ -483,6 +484,7 @@ pub(crate) fn install_cluster(install: &ClusterInstall<'_>) -> Result<Option<u64
         &["--quiet", &format!("--load={}", layout.sysctl_file)],
         None,
     )?;
+    load_apparmor_profile(install.files())?;
     match distribution {
         Distribution::Rke2 if install.server && !cmd::succeeds("id", &["etcd"]) => {
             let (program, args) = ETCD_USER
@@ -521,6 +523,16 @@ pub(crate) fn install_cluster(install: &ClusterInstall<'_>) -> Result<Option<u64
     } else {
         Ok(None)
     }
+}
+
+/// Loads the AppArmor profile among `files`, so containerd finds it loaded and keeps it.
+pub(crate) fn load_apparmor_profile<'a>(
+    mut files: impl Iterator<Item = &'a HostFile>,
+) -> Result<(), InstallError> {
+    if files.any(|f| f.path == APPARMOR_PROFILE) {
+        cmd::run("apparmor_parser", &["--replace", APPARMOR_PROFILE], None)?;
+    }
+    Ok(())
 }
 
 /// Downloads the release into `dir` and its image archives into the image directory, and checks
@@ -781,13 +793,36 @@ fn system_hosts_documents() -> Result<Vec<(Option<String>, &'static str)>, Insta
         .collect()
 }
 
-/// Where traffic from the nodes comes from: the first address of each node's pod range, which a
-/// node's own traffic to pods on other nodes leaves from (Canal's VXLAN interface).
-pub(crate) fn node_addresses(kubectl: &Kubectl) -> Result<Vec<String>, InstallError> {
-    let nodes = kubectl.run(&["get", "nodes", "--output=json"], None)?;
-    let nodes: Value = serde_json::from_str(&nodes)
-        .map_err(|e| InstallError::Message(format!("reading nodes: {e}")))?;
-    Ok(plan::node_sources(&nodes))
+/// How long `apply` and `node sync` wait for every Ready node's VXLAN address.
+pub(crate) const NODE_ADDRESS_WAIT: Duration = Duration::from_mins(2);
+
+/// Where traffic from the nodes comes from ([`plan::node_sources`]), once every Ready node has its
+/// VXLAN address. Asks again every few seconds for up to `wait`.
+pub(crate) fn node_addresses(
+    kubectl: &Kubectl,
+    distribution: Distribution,
+    wait: Duration,
+) -> Result<Vec<String>, InstallError> {
+    let start = Instant::now();
+    loop {
+        let nodes = kubectl.run(&["get", "nodes", "--output=json"], None)?;
+        let nodes: Value = serde_json::from_str(&nodes)
+            .map_err(|e| InstallError::Message(format!("reading nodes: {e}")))?;
+        match plan::node_sources(distribution, &nodes) {
+            Ok(sources) => return Ok(sources),
+            Err(_) if start.elapsed() < wait => std::thread::sleep(Duration::from_secs(3)),
+            Err(NodeWaiting(name)) => {
+                let network = match distribution {
+                    Distribution::K3s => "Calico",
+                    Distribution::Rke2 => "Canal",
+                };
+                return Err(InstallError::Message(format!(
+                    "node {name} has no {network} VXLAN address yet: kubectl get pods -n \
+                     kube-system -o wide"
+                )));
+            }
+        }
+    }
 }
 
 /// Creates the component's Secrets; generated values are made once and kept.
@@ -1596,7 +1631,7 @@ mod tests {
             .map(|(tag, _)| format!("          image: {tag}\n"))
             .collect();
         let manifest = format!(
-            "{}            # - name: CALICO_IPV4POOL_CIDR\n            #   value: \"192.168.0.0/16\"\n",
+            "{}            # - name: CALICO_IPV4POOL_CIDR\n            #   value: \"192.168.0.0/16\"\n            - name: CALICO_IPV4POOL_VXLAN\n              value: \"CrossSubnet\"\n",
             images.concat()
         );
         fs::write(&source, &manifest).unwrap();
@@ -1677,6 +1712,7 @@ mod tests {
         let zeabur = ZeaburPlan {
             url: "https://zeabur.example.com".to_owned(),
             chart: Source::Local(chart.to_string_lossy().into_owned()),
+            version: None,
             values: json!({"updateCheck": {"enabled": true}, "replicas": 1}),
         };
         for on in [true, false] {

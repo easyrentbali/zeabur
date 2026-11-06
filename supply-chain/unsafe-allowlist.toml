@@ -1,5 +1,5 @@
 # Dependencies that are allowed to contain `unsafe` code or link native (C/asm) code.
-# Policy: CONTRIBUTING.md, "Dependencies". `scripts/ci.sh unsafe-report` enforces it.
+# Policy: CONTRIBUTING.md, "Dependencies". `scripts/ci/lint.sh` enforces it.
 #
 # `approved` is the date a maintainer approved the entry. "pending" is a proposal that does not
 # count until a maintainer replaces it with a date. Entries are keyed by crate name, not version: a version
@@ -709,19 +709,6 @@ approved = "2026-10-28"
 name = "utf8-zero"
 kind = "unsafe"
 reason = "ureq's text decoding"
-approved = "2026-10-28"
-
-# --- Parser stack growth (pest 2.9.4 uses stacker to avoid stack overflow on deep input).
-[[crate]]
-name = "psm"
-kind = "unsafe"
-reason = "Stack pointer switching under stacker"
-approved = "2026-10-28"
-
-[[crate]]
-name = "stacker"
-kind = "unsafe"
-reason = "Grows the stack for recursive parsing in pest"
 approved = "2026-10-28"
 
 # --- Web interface: decoding the embedded brotli files for clients without brotli (zeabur-ui).

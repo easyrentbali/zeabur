@@ -24,6 +24,7 @@ import {
   MEMORY,
   memoryUsed,
   nodeIssues,
+  nodeLabel,
   share,
   TIGHT,
   worstNode,
@@ -262,6 +263,7 @@ function NodeList({
     ? nodes.filter(
         (node) =>
           node.name.toLowerCase().includes(needle) ||
+          nodeLabel(node).toLowerCase().includes(needle) ||
           node.roles.some((role) => role.toLowerCase().includes(needle)),
       )
     : nodes
@@ -469,7 +471,7 @@ function NodeRow({
       <div className="flex min-w-56 flex-1 flex-col gap-1">
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
           <span className="font-semibold" translate="no">
-            {node.name}
+            {nodeLabel(node)}
           </span>
           <NodePills node={node} />
           <span className="type-meta text-muted-foreground">

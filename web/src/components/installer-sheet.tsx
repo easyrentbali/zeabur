@@ -4,6 +4,7 @@ import XIcon from "~icons/ph/x"
 
 import { capabilitiesQuery } from "@/api/queries"
 import { Command } from "@/components/bits"
+import { ComponentInstaller } from "@/components/component-install"
 import { Button } from "@zeabur-oss/design-system/components/button"
 import {
   Dialog,
@@ -16,8 +17,8 @@ import type { Needed } from "@/model/installer"
 
 const CONFIG = "/etc/zeabur-installer/config.yaml"
 
-/** The installer commands that install components on the server, all in one step, or remove one.
- * Where zeabur-installer did not set up the cluster, `zeaburctl components export` instead. */
+/** Native, permission-checked component installation, with server commands as an advanced option.
+ * Removal retains the existing documented path and never implicitly takes over an external release. */
 export function InstallerSheet({
   components,
   remove = false,
@@ -63,8 +64,15 @@ export function InstallerSheet({
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5">
           {reason ? <p className="text-pretty">{reason}</p> : null}
-          {installer === false ? null : (
-            <InstallerSteps components={components} names={names} remove={remove} />
+          {remove ? (
+            installer === false ? null : (
+              <InstallerSteps components={components} names={names} remove />
+            )
+          ) : (
+            <ComponentInstaller
+              key={components.map((entry) => entry.id).join(",")}
+              components={components}
+            />
           )}
           {note ? <p className="type-meta text-pretty text-muted-foreground">{note}</p> : null}
           {remove ? (
@@ -72,8 +80,18 @@ export function InstallerSheet({
               {installer === false ? null : <p>{t("installer.stays")}</p>}
               <p>{t("installer.elsewhere")}</p>
             </div>
-          ) : installer === true ? null : (
-            <ExportStep components={components} installer={installer} />
+          ) : (
+            <details className="border-t pt-4">
+              <summary className="cursor-pointer text-sm text-muted-foreground">
+                Advanced installation commands
+              </summary>
+              <div className="mt-4 flex flex-col gap-5">
+                {installer === false ? null : (
+                  <InstallerSteps components={components} names={names} remove={false} />
+                )}
+                {installer === true ? null : <ExportStep components={components} />}
+              </div>
+            </details>
           )}
         </div>
       </DialogContent>
@@ -111,12 +129,11 @@ function InstallerSteps({
   )
 }
 
-function ExportStep({ components, installer }: { components: Needed[]; installer?: boolean }) {
-  const t = useT()
+function ExportStep({ components }: { components: Needed[] }) {
   return (
     <section className="flex flex-col gap-2">
       <p className="text-pretty">
-        {installer === false ? t("installer.notHere") : t("installer.otherCluster")}
+        To apply the pinned manifests with your own tools instead, export them below.
       </p>
       <Command text={`zeaburctl components export ${components.map((c) => c.id).join(" ")}`} />
     </section>

@@ -6,6 +6,7 @@ pub(crate) mod certificates;
 mod cluster;
 mod full;
 mod identity;
+mod identity_release;
 mod images;
 mod registries;
 mod snapshot;
@@ -59,8 +60,8 @@ pub(crate) struct Up {
     /// What to install besides the cluster.
     #[arg(long, value_enum, default_value_t)]
     pub(crate) profile: Profile,
-    /// Build Zeabur Identity from this working tree, as it is, instead of
-    /// `ZEABUR_IDENTITY_PINNED` fetched from `ZEABUR_IDENTITY_GIT`.
+    /// Build Zeabur Identity from this working tree, as it is, instead of the release that
+    /// `ZEABUR_IDENTITY_PINNED` names.
     #[arg(long, value_name = "DIR", env = "ZEABUR_IDENTITY_SRC")]
     pub(crate) identity_src: Option<PathBuf>,
     /// Build Zeabur Builder from this working tree, as it is (full profile), instead of
@@ -148,6 +149,33 @@ impl DevCluster {
             .args(["-n", namespace, "rollout", "status", workload])
             .arg(format!("--timeout={}s", timeout.as_secs()))
             .run()
+            .inspect_err(|_| self.diagnose(namespace))
+    }
+
+    /// Prints what a failed wait in `namespace` leaves no other trace of, since the cluster is
+    /// deleted when a CI job ends: the pods, the events, and the description and log tail of
+    /// each pod that is not Ready.
+    fn diagnose(&self, namespace: &str) {
+        self.kubectl()
+            .args(["-n", namespace, "get", "pods", "-o", "wide"])
+            .report();
+        self.kubectl()
+            .args(["-n", namespace, "get", "events", "--sort-by=.lastTimestamp"])
+            .report();
+        let pods = self
+            .kubectl()
+            .args(["-n", namespace, "get", "pods", "-o", "json"])
+            .probe()
+            .map_or_default(|json| not_ready(&json));
+        for pod in pods {
+            self.kubectl()
+                .args(["-n", namespace, "describe", "pod", &pod])
+                .report();
+            self.kubectl()
+                .args(["-n", namespace, "logs", "--all-containers", "--prefix"])
+                .args(["--tail=40", &pod])
+                .report();
+        }
     }
 
     /// Notes an image this cluster tagged, for `down` to remove.
@@ -167,6 +195,34 @@ impl DevCluster {
         fs::write(&path, content).map_err(|e| format!("writing {}: {e}", path.display()))?;
         Ok(path)
     }
+}
+
+/// The names of the pods in `kubectl get pods -o json` that are not Ready and not finished.
+fn not_ready(json: &str) -> Vec<String> {
+    let Ok(list) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let ready = |pod: &serde_json::Value| {
+        pod.pointer("/status/phase")
+            .and_then(|phase| phase.as_str())
+            == Some("Succeeded")
+            || pod
+                .pointer("/status/conditions")
+                .and_then(|conditions| conditions.as_array())
+                .is_some_and(|conditions| {
+                    conditions.iter().any(|c| {
+                        c.pointer("/type").and_then(|t| t.as_str()) == Some("Ready")
+                            && c.pointer("/status").and_then(|s| s.as_str()) == Some("True")
+                    })
+                })
+    };
+    list.pointer("/items")
+        .and_then(|items| items.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|pod| !ready(pod))
+        .filter_map(|pod| pod.pointer("/metadata/name")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Creates the cluster or brings a running one in line with the checkout.
@@ -215,7 +271,7 @@ pub(crate) fn up(options: &Up) -> Result<(), String> {
         &[],
         catalog::stop_at_from_env().as_deref(),
     )?;
-    // Before Zeabur, so that e2e-l2's removal check counts them as the cluster's own.
+    // Before Zeabur, so that e2e's removal check counts them as the cluster's own.
     if options.profile == Profile::Full {
         full::install(&dev, options.builder_src.as_deref())?;
     }
@@ -286,6 +342,7 @@ pub(crate) fn down() -> Result<(), String> {
         "registries.yaml",
         "install.yaml",
         "identityctl",
+        "identity-release",
     ] {
         let path = dev.state.join(name);
         let removed = match fs::symlink_metadata(&path) {
@@ -312,7 +369,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Profile, Up};
+    use super::{Profile, Up, not_ready};
 
     #[derive(Debug, Parser)]
     struct Cli {
@@ -322,6 +379,19 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Up, clap::Error> {
         Cli::try_parse_from(std::iter::once("up").chain(args.iter().copied())).map(|cli| cli.up)
+    }
+
+    #[test]
+    fn only_pods_that_are_neither_ready_nor_finished_are_listed() {
+        let json = r#"{"items": [
+            {"metadata": {"name": "up"}, "status": {"phase": "Running",
+              "conditions": [{"type": "Ready", "status": "True"}]}},
+            {"metadata": {"name": "stuck"}, "status": {"phase": "Running",
+              "conditions": [{"type": "Ready", "status": "False"}]}},
+            {"metadata": {"name": "new"}, "status": {"phase": "Pending"}},
+            {"metadata": {"name": "job"}, "status": {"phase": "Succeeded",
+              "conditions": [{"type": "Ready", "status": "False"}]}}]}"#;
+        assert_eq!(not_ready(json), ["stuck", "new"]);
     }
 
     #[test]

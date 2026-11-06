@@ -10,8 +10,13 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::{env, io, process};
+use sha2::{Digest as _, Sha256};
 
 fn main() {
+    if let Err(error) = verify_native_assets() {
+        println!("cargo::error=component manifest asset verification failed: {error}");
+        process::exit(1);
+    }
     println!("cargo::rerun-if-env-changed=ZEABUR_CATALOG_RELEASE");
     println!("cargo::rerun-if-env-changed=ZEABUR_CATALOG_COMMIT");
     let (Some(release), Some(_)) = (
@@ -65,6 +70,30 @@ fn main() {
     if let Err(error) = fs::write(out.join("bundle.rs"), code) {
         println!("cargo::error=cannot write bundle.rs: {error}");
     }
+}
+
+fn verify_native_assets() -> Result<(), String> {
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default())
+        .join("src/install/native/assets");
+    let provenance = root.join("provenance.json");
+    println!("cargo::rerun-if-changed={}",provenance.display());
+    let entries: serde_json::Value = serde_json::from_slice(&fs::read(&provenance).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    for entry in entries.as_array().ok_or("asset provenance must be an array")? {
+        let file = entry["file"].as_str().ok_or("asset filename is missing")?;
+        if file.contains(['/', '\\']) { return Err("asset filename must be local".to_owned()); }
+        let path = root.join(file);
+        println!("cargo::rerun-if-changed={}",path.display());
+        let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+        let checksum = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if checksum != entry["sha256"].as_str().ok_or("asset checksum is missing")? {
+            return Err(format!("checksum mismatch for {file}"));
+        }
+    }
+    Ok(())
 }
 
 type Components = Vec<(String, String, PathBuf)>;

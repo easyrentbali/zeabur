@@ -210,11 +210,6 @@ pub fn removals(
         .iter()
         .map(|i| i.component.as_str())
         .filter(|id| !planned.contains(id))
-        .filter(|id| {
-            !index
-                .replacement_of(id)
-                .is_some_and(|new| planned.contains(new))
-        })
         .collect();
     let mut warnings = Vec::new();
     let mut order: Vec<&Component> = Vec::new();
@@ -337,10 +332,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::plan::{Facts, plan};
-    const INDEX: &str = include_str!(concat!(env!("ZEABUR_CATALOG_RELEASE"), "/index.json"));
 
     fn index() -> Index {
-        Index::parse(INDEX.as_bytes()).unwrap()
+        crate::catalog::pinned()
     }
 
     fn planned(extra: &str) -> Vec<ComponentPlan> {
@@ -359,6 +353,7 @@ mod tests {
             node_ips: Vec::new(),
             record: None,
             installer: None,
+            apparmor_restricts_unconfined: false,
         };
         plan(&index(), &config, &facts).unwrap().components
     }
@@ -412,30 +407,20 @@ mod tests {
     }
 
     #[test]
-    fn zot_is_not_removed_while_builder_takes_over_its_release() {
+    fn a_component_the_catalog_no_longer_has_is_left_with_a_warning() {
         let now = planned("");
-        assert!(
-            now.iter().any(|c| c.id == "builds/zeabur-builder"),
-            "builder is planned"
-        );
         let mut found = installed(&now);
-        for chart in &mut found {
-            if chart.component == "builds/zeabur-builder" && chart.chart == "zot" {
-                chart.component = "container-registry/zot".to_owned();
-            }
-        }
-        let (kept, warnings) = removals(&index(), &now, &found, "single-node", &[]);
-        assert_eq!(kept, []);
-        assert_eq!(warnings, []);
-
-        let without = planned("disable: [builds/zeabur-builder]\n");
-        found.retain(|chart| chart.component == "container-registry/zot");
-        let (left, warnings) = removals(&index(), &without, &found, "single-node", &[]);
-        assert_eq!(left, []);
+        found.push(Installed {
+            component: "legacy/gone".to_owned(),
+            chart: "gone".to_owned(),
+            namespace: "gone".to_owned(),
+        });
+        let (removals, warnings) = removals(&index(), &now, &found, "single-node", &[]);
+        assert_eq!(removals, []);
         assert!(
             warnings
                 .iter()
-                .any(|w| w.code == "remove.unknown" && w.values.contains(&"zot".to_owned())),
+                .any(|w| w.code == "remove.unknown" && w.values.contains(&"gone".to_owned())),
             "{warnings:?}"
         );
     }

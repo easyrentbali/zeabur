@@ -17,6 +17,7 @@ import { usageQuery } from "@/api/queries"
 import { Skeleton } from "@zeabur-oss/design-system/components/skeleton"
 import { PHONE, useMedia } from "@/lib/media"
 import { serviceLink } from "@/lib/place"
+import { serviceTitle } from "@/model/service-name"
 import { useQuantityFormat } from "@/lib/quantity"
 import { cn } from "@/lib/utils"
 import {
@@ -230,7 +231,7 @@ export function ServicesTable({
                         <ServiceIcon service={service} size="sm" />
                         <span className="flex min-w-0 flex-col leading-tight">
                           <span className="truncate font-medium hover:underline" translate="no">
-                            {service.name}
+                            {serviceTitle(service)}
                           </span>
                           {service.image ? (
                             <span
@@ -358,7 +359,7 @@ function ServiceLines({
               >
                 <StatusDot health={status.health} />
                 <span className="min-w-0 flex-1 truncate font-medium" translate="no">
-                  {service.name}
+                  {serviceTitle(service)}
                 </span>
                 <span
                   className={cn(

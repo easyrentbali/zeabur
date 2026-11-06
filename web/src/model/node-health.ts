@@ -8,6 +8,9 @@ import { severity } from "@/model/severity"
 type NodeView = Schemas.NodeView
 type DiskUsage = Schemas.DiskUsage
 
+export const nodeLabel = (node: Pick<NodeView, "name" | "displayName">) =>
+  node.displayName ?? node.name
+
 /** Share of allocatable reserved above which new pods may not fit. */
 export const TIGHT = 0.9
 /** Memory in use: the kernel kills processes as it runs out. */

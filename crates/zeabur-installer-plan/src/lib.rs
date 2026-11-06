@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod config;
 pub mod join;
 pub mod k3s;
+pub mod kube_version;
 pub mod kubesolo;
 pub mod node_name;
 pub mod personal;
@@ -33,14 +34,6 @@ pub enum PlanError {
     /// A capability or component name matches nothing in the catalog.
     #[error("`{0}` is not a capability or component in this catalog")]
     Unknown(String),
-    /// `enable` or `disable` names a component id that another component replaces.
-    #[error("`{old}` is now `{new}` in this catalog. Write `{new}` in the configuration instead")]
-    Renamed {
-        /// The id in the configuration.
-        old: String,
-        /// The id in the catalog.
-        new: String,
-    },
     /// The install record was written by a newer installer.
     #[error(
         "this server was installed with zeabur-installer {recorded}, which is newer than this one \

@@ -294,9 +294,23 @@ pub fn classify_with(workload: Workload<'_>, conventions: &Conventions) -> Class
             resolve_group_with(labels, conventions)
         }
         .to_owned(),
-        display_name: None,
+        display_name: display_name_annotation(meta, conventions),
         managed_by: None,
     }
+}
+
+/// A human title is metadata only; workload names remain Kubernetes identities.
+fn display_name_annotation(meta: &ObjectMeta, conventions: &Conventions) -> Option<String> {
+    meta.annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(conventions.display_name_annotation.as_ref()))
+        .map(|value| value.trim())
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().count() <= 64
+                && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
 }
 
 /// The phase of a Deployment, from its rollout conditions rather than replica counts alone, so a
@@ -550,5 +564,62 @@ fn shell_command(cron_job: &CronJob) -> Option<String> {
     match container.command.as_deref()? {
         [shell, flag, command] if shell == "/bin/sh" && flag == "-c" => Some(command.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod display_name_annotation_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+
+    fn deployment(title: Option<&str>) -> Deployment {
+        Deployment {
+            metadata: ObjectMeta {
+                name: Some("service-existing".to_owned()),
+                annotations: title.map(|value| BTreeMap::from([(
+                    "zeabur.com/display-name".to_owned(), value.to_owned()
+                )])),
+                ..ObjectMeta::default()
+            },
+            ..Deployment::default()
+        }
+    }
+
+    #[test]
+    fn display_name_annotation_preserves_the_workload_identity() {
+        let object = deployment(Some("  Waxum Gateway  "));
+        let workload = Workload::Deployment(&object);
+        assert_eq!(classify(workload).display_name.as_deref(), Some("Waxum Gateway"));
+        assert_eq!(workload.reference().name, "service-existing");
+        assert!(classify(workload).managed_by.is_none());
+    }
+
+    #[test]
+    fn display_name_annotation_rejects_blank_oversized_and_control_titles() {
+        let oversized = "a".repeat(65);
+        for value in [None, Some("  "), Some("Waxum\nGateway"), Some(oversized.as_str())] {
+            assert!(classify(Workload::Deployment(&deployment(value))).display_name.is_none());
+        }
+    }
+
+    #[test]
+    fn display_name_annotation_keeps_database_operator_precedence() {
+        let mut object = deployment(Some("Misleading application title"));
+        object.metadata.owner_references = Some(vec![OwnerReference {
+            api_version: "postgres-operator.crunchydata.com/v1beta1".to_owned(),
+            kind: "PostgresCluster".to_owned(),
+            name: "customer-database".to_owned(),
+            uid: "fixture-owner".to_owned(),
+            controller: Some(true),
+            block_owner_deletion: None,
+        }]);
+        object.metadata.labels = Some(BTreeMap::from([(
+            "postgres-operator.crunchydata.com/data".to_owned(), "postgres".to_owned()
+        )]));
+        let classification = classify(Workload::Deployment(&object));
+        assert_eq!(classification.display_name.as_deref(), Some("customer-database"));
+        assert_eq!(classification.managed_by.unwrap().name, "customer-database");
+        assert_eq!(object.metadata.name.as_deref(), Some("service-existing"));
     }
 }

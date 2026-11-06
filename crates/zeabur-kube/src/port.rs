@@ -651,6 +651,23 @@ pub struct Unreadable {
     pub status: KubernetesStatus,
 }
 
+/// Container image references from a workload template; never environment or Secret values.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkloadImages {
+    /// Deployment, StatefulSet or DaemonSet.
+    pub kind: String,
+    /// The workload's namespace.
+    pub namespace: String,
+    /// The workload's name.
+    pub name: String,
+    /// Metadata labels used by catalogue detection.
+    pub labels: BTreeMap<String, String>,
+    /// Pod template labels used to associate runtime images with a component.
+    pub template_labels: BTreeMap<String, String>,
+    /// Container name to configured image reference.
+    pub images: BTreeMap<String, String>,
+}
+
 /// Facts about the whole cluster, for capability detection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClusterFacts {
@@ -686,6 +703,8 @@ pub struct ClusterFacts {
     /// Labels of every Deployment, StatefulSet and DaemonSet the person can list, for detection
     /// by workload labels.
     pub workload_labels: Vec<(String, BTreeMap<String, String>)>,
+    /// Workload template images for installed version provenance.
+    pub workload_images: Vec<WorkloadImages>,
     /// Probes that could not run.
     pub unreadable: Vec<Unreadable>,
 }

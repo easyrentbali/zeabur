@@ -4,7 +4,7 @@ import { useId, useState } from "react"
 import CaretDownIcon from "~icons/ph/caret-down"
 import MagnifyingGlassIcon from "~icons/ph/magnifying-glass"
 
-import { isStatus, toProblem } from "@/api/client"
+import { isStatus, toProblem, type Schemas } from "@/api/client"
 import { projectsQuery } from "@/api/queries"
 import { AdoptMenu } from "@/components/adopt"
 import { NewProjectButton } from "@/components/new-project"
@@ -110,21 +110,39 @@ export function OtherNamespaces({
   )
 }
 
+export function OtherNamespacesSection({ items }: { items: readonly Schemas.ProjectSummary[] }) {
+  const t = useT()
+  const [showSystem, setShowSystem] = useState(false)
+  const switchId = useId()
+  const other = otherNamespaces(items, showSystem)
+  return (
+    <details>
+      <summary className="type-heading cursor-pointer rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        {t("projects.other")}
+      </summary>
+      <div className="mt-3 flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <Switch id={switchId} checked={showSystem} onCheckedChange={setShowSystem} />
+          <Label htmlFor={switchId}>{t("projects.showSystem")}</Label>
+        </div>
+        <OtherNamespaces namespaces={other} />
+      </div>
+    </details>
+  )
+}
+
 export function ProjectsPage() {
   const t = useT()
   const search = route.useSearch()
   const navigate = useNavigate({ from: "/projects" })
   const projects = useQuery(projectsQuery)
   const list = projectsAsList.useValue()
-  const [showSystem, setShowSystem] = useState(false)
-  const switchId = useId()
   const items = projects.data?.items ?? []
   const rank = (p: (typeof items)[number]) =>
     p.health ? healthRank[countsHealth(p.health)] : healthRank.ok
   const adopted = items
     .filter((p) => p.adopted)
     .toSorted((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
-  const other = otherNamespaces(items, showSystem)
 
   return (
     <PageColumn gap="lg" className="mt-6 mb-12 md:mt-10">
@@ -189,16 +207,7 @@ export function ProjectsPage() {
               </EmptyHeader>
             </Empty>
           )}
-          <section className="flex flex-col gap-3">
-            <div className="flex flex-wrap items-end justify-between gap-2">
-              <h2 className="type-heading">{t("projects.other")}</h2>
-              <div className="flex items-center gap-2">
-                <Switch id={switchId} checked={showSystem} onCheckedChange={setShowSystem} />
-                <Label htmlFor={switchId}>{t("projects.showSystem")}</Label>
-              </div>
-            </div>
-            <OtherNamespaces namespaces={other} />
-          </section>
+          <OtherNamespacesSection items={items} />
         </>
       )}
     </PageColumn>

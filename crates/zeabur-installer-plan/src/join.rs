@@ -49,6 +49,12 @@ pub struct JoinFacts {
     pub ports: Vec<(u16, bool)>,
     /// The token carries the cluster CA's hash, so the node checks whom it joins.
     pub token_pinned: bool,
+    /// Longhorn's manager runs on this node, which has joined already: the cluster installed
+    /// Longhorn after it joined, so its configuration may not say `longhorn: true`.
+    pub longhorn_runs_here: bool,
+    /// The node's unit (`k3s-agent`, `rke2-server`, …) is running: the node joined already and
+    /// holds its own ports.
+    pub unit_running: bool,
 }
 
 /// One port and what was found.
@@ -152,6 +158,8 @@ pub struct JoinPlan {
     pub ports: Vec<Port>,
     /// Ports on this VM that `apply` checks are free before the node starts.
     pub local_ports: Vec<Port>,
+    /// The node's unit is running, so its ports are in use by it and `apply` doesn't check them.
+    pub unit_running: bool,
     /// Things to read before applying.
     pub warnings: Vec<Warning>,
     /// Things `apply` refuses to go on with.
@@ -308,7 +316,7 @@ fn standing_warnings(
             "join.storage.longhorn",
             &[],
             "The cluster runs Longhorn: apply installs an iSCSI initiator and an NFS client here, \
-             starts iscsid and loads iscsi_tcp. Longhorn then keeps replicas under \
+             starts iscsid and loads iscsi_tcp and dm_crypt. Longhorn then keeps replicas under \
              /var/lib/longhorn on this node's disk. Volumes on local-path still stay on the node \
              that created them."
                 .to_owned(),
@@ -374,6 +382,7 @@ pub fn plan(config: &JoinConfig, facts: &JoinFacts) -> Result<JoinPlan, PlanErro
     host_files.push(distribution.join_file(&join.server));
     host_files.push(distribution.node_name_file(&node_name));
     host_files.extend(distribution.node_ip_file(&facts.facts.node_ips));
+    host_files.extend(facts.facts.apparmor_profile());
     if let Some(registry) = &join.registry {
         host_files
             .push(distribution.registries_file(&registry.host, &registry.cluster_ip.to_string()));
@@ -397,11 +406,12 @@ pub fn plan(config: &JoinConfig, facts: &JoinFacts) -> Result<JoinPlan, PlanErro
     }
 
     let ports = ports(distribution, join.role, &facts.ports, &host, &mut warnings);
+    let longhorn = join.longhorn || facts.longhorn_runs_here;
     warnings.extend(standing_warnings(
         distribution,
         join.role,
         facts.token_pinned,
-        join.longhorn,
+        longhorn,
     ));
 
     Ok(JoinPlan {
@@ -413,7 +423,7 @@ pub fn plan(config: &JoinConfig, facts: &JoinFacts) -> Result<JoinPlan, PlanErro
         cluster,
         host_file_paths: host_files.iter().map(|f| f.path.clone()).collect(),
         host_files,
-        node_prep: join.longhorn.then_some(storage::LONGHORN_PREP),
+        node_prep: longhorn.then_some(storage::LONGHORN_PREP),
         rtt,
         ports,
         local_ports: distribution
@@ -426,6 +436,7 @@ pub fn plan(config: &JoinConfig, facts: &JoinFacts) -> Result<JoinPlan, PlanErro
                 open: None,
             })
             .collect(),
+        unit_running: facts.unit_running,
         warnings,
         blockers,
     })
@@ -457,10 +468,13 @@ mod tests {
                 node_ips: vec!["10.0.0.6".to_owned(), "fd00::6".to_owned()],
                 record: None,
                 installer: None,
+                apparmor_restricts_unconfined: false,
             },
             rtt_us: rtt_us.to_vec(),
             ports: vec![(9345, true), (6443, true), (10250, false)],
             token_pinned: true,
+            longhorn_runs_here: false,
+            unit_running: false,
         }
     }
 
@@ -597,6 +611,19 @@ mod tests {
     }
 
     #[test]
+    fn a_node_that_joined_before_longhorn_is_prepared_for_it() {
+        let facts = JoinFacts {
+            longhorn_runs_here: true,
+            unit_running: true,
+            ..facts(&[500; 5])
+        };
+        let p = plan(&config(""), &facts).unwrap();
+        assert_eq!(p.node_prep, Some(storage::LONGHORN_PREP));
+        assert!(codes(&p).contains(&"join.storage.longhorn"));
+        assert!(!codes(&p).contains(&"join.storage.local"));
+    }
+
+    #[test]
     fn node_add_gives_the_same_advice() {
         let codes = |role| {
             advice(Distribution::Rke2, role, false)
@@ -643,5 +670,20 @@ mod tests {
                 .any(|f| f.ends_with("50-zeabur-identity.yaml"))
         );
         assert!(p.ports.iter().any(|port| port.number == 2380));
+    }
+
+    #[test]
+    fn servers_and_workers_on_a_host_that_restricts_unconfined_get_containerds_apparmor_profile() {
+        let mut restricted = facts(&[500; 5]);
+        restricted.facts.apparmor_restricts_unconfined = true;
+        for extra in ["", "  role: server\n  serverConfig: {}\n"] {
+            let plain = plan(&config(extra), &facts(&[500; 5])).unwrap();
+            assert!(!plain.host_files.contains(&cluster::apparmor_profile()));
+            let p = plan(&config(extra), &restricted).unwrap();
+            assert!(
+                p.host_files.contains(&cluster::apparmor_profile()),
+                "{extra}"
+            );
+        }
     }
 }

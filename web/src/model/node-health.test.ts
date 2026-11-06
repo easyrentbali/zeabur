@@ -10,11 +10,25 @@ import {
   isProblem,
   MEMORY,
   nodeIssues,
+  nodeLabel,
   worstNode,
 } from "@/model/node-health"
 import { missingReason, volumeFill } from "@/model/volume-use"
 
 const GiB = 2 ** 30
+
+describe("node labels", () => {
+  test("uses the display name without changing the node identity", () => {
+    const named = { name: "hostdzire-worker-1", displayName: "HDZ-NL-worker-1" }
+    expect(nodeLabel(named)).toBe("HDZ-NL-worker-1")
+    expect(named.name).toBe("hostdzire-worker-1")
+  })
+
+  test("falls back for nodes without a display name", () => {
+    expect(nodeLabel({ name: "hostdzire-worker-1" })).toBe("hostdzire-worker-1")
+    expect(nodeLabel({ name: "hostdzire-worker-1", displayName: null })).toBe("hostdzire-worker-1")
+  })
+})
 
 const node = (name: string, more: Partial<Schemas.NodeView> = {}): Schemas.NodeView => ({
   id: `nodes/${name}`,

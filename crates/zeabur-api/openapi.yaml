@@ -16,7 +16,7 @@ info:
   license:
     name: Apache-2.0
     identifier: Apache-2.0
-  version: 0.1.2-beta.2
+  version: 0.2.0-beta.1
 paths:
   /api/v1/account:
     get:
@@ -270,6 +270,126 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CapabilityList"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/cluster/components/install/apply:
+    post:
+      tags:
+      - cluster
+      summary: >-
+        Apply once after fresh authorization, absence/UID/RV checks, and all feasible
+        dry-runs.
+      operationId: applyComponentInstallation
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InstallApply"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstallApplied"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/cluster/components/install/plan:
+    post:
+      tags:
+      - cluster
+      summary: >-
+        Read-only, identity-bound preview. Sensitive values only enter the encrypted
+        token.
+      operationId: planComponentInstallation
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InstallRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstallPlan"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /api/v1/cluster/components/install/resume-plan:
+    post:
+      tags:
+      - cluster
+      summary: >-
+        Explicit read-only re-review of remaining phases after the original consent
+        expires.
+      operationId: planComponentInstallationResume
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InstallResumeRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstallPlan"
+        "403":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  "/api/v1/cluster/components/{capability}/{component}/installation":
+    get:
+      tags:
+      - cluster
+      summary: >-
+        Installation eligibility and independently observed progress, without sensitive
+        values.
+      operationId: getComponentInstallation
+      parameters:
+      - name: capability
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: component
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComponentInstallation"
         "403":
           content:
             application/problem+json:
@@ -6503,7 +6623,7 @@ components:
           type:
           - string
           - "null"
-          description: "The distribution, when the version names one: `k3s` or `rke2`."
+          description: "The distribution, when the version names one: `k3s`, `rke2` or `kubesolo`."
         domains:
           $ref: "#/components/schemas/DomainSettings"
           description: How a new service's public URL is made.
@@ -6891,7 +7011,7 @@ components:
           type: array
           items:
             type: string
-          description: The distributions it supports (`k3s`, …); empty means all.
+          description: The distributions it supports (`k3s`, …).
         homepage:
           type: string
           description: The project's home page.
@@ -6910,6 +7030,65 @@ components:
             type: string
           propertyNames:
             type: string
+    ComponentInstallation:
+      type: object
+      required:
+      - component
+      - profiles
+      - inputs
+      - installable
+      - reasons
+      - missingPrerequisites
+      - state
+      - resources
+      - message
+      - phase
+      - totalPhases
+      - resumeAvailable
+      properties:
+        component:
+          type: string
+        continuationToken:
+          type:
+          - string
+          - "null"
+        inputs:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstallInput"
+        installable:
+          type: boolean
+        message:
+          type: string
+        missingPrerequisites:
+          type: array
+          items:
+            type: string
+          description: >-
+            Missing catalogue component identifiers; install each using its own reviewed
+            plan.
+        phase:
+          type: integer
+          minimum: 0
+        profiles:
+          type: array
+          items:
+            type: string
+        reasons:
+          type: array
+          items:
+            type: string
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstallResource"
+        resumeAvailable:
+          type: boolean
+        state:
+          type: string
+        totalPhases:
+          type: integer
+          minimum: 0
     ComponentUpgrade:
       type: string
       description: The installed version against the tested one. An open set.
@@ -9820,7 +9999,7 @@ components:
           minimum: 0
         environment:
           type: string
-          description: "Where it was measured: `<profile>-<architecture>-<Kubernetes version>`."
+          description: "Where it was measured: `<distribution>-<profile>-<architecture>-<Kubernetes version>`."
         measuredAt:
           type: string
           description: The day it was measured (`2026-10-25`).
@@ -10048,6 +10227,65 @@ components:
           - $ref: "#/components/schemas/RegistryLogin"
             description: Credentials typed in, used instead of `pullSecret`.
           - type: "null"
+    InstallApplied:
+      type: object
+      required:
+      - component
+      - state
+      - written
+      - phase
+      - totalPhases
+      - message
+      properties:
+        component:
+          type: string
+        continuationToken:
+          type:
+          - string
+          - "null"
+        message:
+          type: string
+        phase:
+          type: integer
+          minimum: 0
+        state:
+          type: string
+        totalPhases:
+          type: integer
+          minimum: 0
+        written:
+          type: array
+          items:
+            type: string
+    InstallApply:
+      type: object
+      required:
+      - token
+      properties:
+        token:
+          type: string
+      additionalProperties: false
+    InstallInput:
+      type: object
+      description: A value the install needs from the person, or generates.
+      required:
+      - name
+      - description
+      - required
+      - generated
+      properties:
+        description:
+          type: string
+          description: What it is.
+        generated:
+          type: boolean
+          description: It is generated at random, not asked for.
+        name:
+          type: string
+          description: Its name, the `<name>` placeholder in the texts.
+        required:
+          type: boolean
+          description: It must be given.
     InstallMethod:
       type: string
       description: How Zeabur was installed, which says how to upgrade it.
@@ -10057,6 +10295,91 @@ components:
       - argo-cd
       - flux
       - zeaburctl
+    InstallPhase:
+      type: object
+      required:
+      - index
+      - title
+      - resources
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstallResource"
+        title:
+          type: string
+    InstallPlan:
+      type: object
+      required:
+      - token
+      - expiresAt
+      - component
+      - profile
+      - writes
+      - warnings
+      - phases
+      properties:
+        component:
+          type: string
+        expiresAt:
+          type: string
+        phases:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstallPhase"
+        profile:
+          type: string
+        token:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+        writes:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstallWrite"
+    InstallRequest:
+      type: object
+      required:
+      - component
+      - profile
+      properties:
+        component:
+          type: string
+        inputs:
+          type: object
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        profile:
+          type: string
+      additionalProperties: false
+    InstallResource:
+      type: object
+      required:
+      - kind
+      - name
+      - namespace
+      properties:
+        kind:
+          type: string
+        name:
+          type: string
+        namespace:
+          type: string
+    InstallResumeRequest:
+      type: object
+      required:
+      - component
+      properties:
+        component:
+          type: string
+      additionalProperties: false
     InstallSource:
       type: string
       description: How a component was installed.
@@ -10066,6 +10389,26 @@ components:
       - helm-chart
       - helm
       - other
+    InstallWrite:
+      type: object
+      required:
+      - kind
+      - name
+      - namespace
+      - afterYaml
+      properties:
+        afterYaml:
+          type: string
+        beforeYaml:
+          type:
+          - string
+          - "null"
+        kind:
+          type: string
+        name:
+          type: string
+        namespace:
+          type: string
     Installation:
       type: object
       description: One installed component.
@@ -10073,6 +10416,7 @@ components:
       - component
       - displayName
       - source
+      - runtimeImages
       properties:
         component:
           type: string
@@ -10085,6 +10429,13 @@ components:
           - string
           - "null"
           description: "The tool that manages it and upgrades it (`k3s`, `RKE2`): never flagged for an upgrade."
+        runtimeImages:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuntimeImage"
+          description: >-
+            Configured workload images; separate from chart versions and chart upgrade
+            comparisons.
         source:
           $ref: "#/components/schemas/InstallSource"
           description: How it was installed.
@@ -11622,6 +11973,11 @@ components:
               The kubelet's filesystem (`nodefs`), where pods' logs, writable layers and `emptyDir`
               volumes live, from the metrics store; absent when the store has no value for this node.
           - type: "null"
+        displayName:
+          type:
+          - string
+          - "null"
+          description: The human-readable `erb.easyrentbali.com/display-name` annotation, when set.
         id:
           type: string
           description: "`cluster/nodes/<name>`."
@@ -15535,6 +15891,37 @@ components:
           items:
             $ref: "#/components/schemas/UnreadableView"
           description: What could not be read.
+    RuntimeImage:
+      type: object
+      description: >-
+        A configured workload image and its version tag. Digest-only images stay
+        explicitly pinned.
+      required:
+      - workload
+      - container
+      - image
+      properties:
+        container:
+          type: string
+          description: Container name.
+        image:
+          type: string
+          description: Full image reference, including any immutable digest.
+        version:
+          type:
+          - string
+          - "null"
+          description: Version tag if it is a version; absent for digest-only or unversioned tags.
+        versionSource:
+          type:
+          - string
+          - "null"
+          description: >-
+            image-tag or workload-app-version (the latter only for a single-container
+            workload).
+        workload:
+          type: string
+          description: Kind/namespace/name of the workload template this reference came from.
     S3Destination:
       type: object
       description: One S3 destination, without its keys.
@@ -17313,7 +17700,7 @@ components:
           type:
           - string
           - "null"
-          description: "`k3s` or `rke2`, when the version names one."
+          description: "`k3s`, `rke2` or `kubesolo`, when the version names one."
         extensions:
           $ref: "#/components/schemas/UpgradeExtensions"
           description: |-

@@ -8,6 +8,7 @@ mod backups;
 mod certificates;
 mod cluster_name;
 mod cluster_tools;
+mod component_install;
 #[cfg(test)]
 #[path = "../common/mod.rs"]
 mod common;
@@ -38,6 +39,8 @@ mod rollout;
 mod s3_destinations;
 mod source_upload;
 mod storage;
+#[cfg(test)]
+mod support;
 mod templates;
 mod terminal;
 mod timeline;

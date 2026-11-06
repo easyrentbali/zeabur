@@ -10,13 +10,15 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::catalog::{Component, Encoding, Health, Index, Input, SecretRef};
+use crate::catalog::{
+    Component, Encoding, Generate, Health, Index, Input, KIND, PodSecurity, ReleaseType, SecretRef,
+};
 use crate::cluster::{self, Distribution, HostFile};
-use crate::config::{AccessMode, Config};
+use crate::config::{AccessMode, Config, Sources};
 use crate::pins::{self, CALICO, K3S, K3s, RKE2};
-use crate::record::{Changes, Record};
+use crate::record::{Changes, Planned, Record};
 use crate::remove::Removal;
-use crate::select::{self, Selection, Why};
+use crate::select::{self, Selection, Target, Why};
 use crate::storage::{self, NodePrep, Storage};
 use crate::{PlanError, node_name, values};
 
@@ -74,9 +76,20 @@ pub struct Facts {
     /// The version of the installer that last applied, as kept on the host.
     #[serde(skip)]
     pub installer: Option<String>,
+    /// `kernel.apparmor_restrict_unprivileged_unconfined` is 1; see
+    /// [`cluster::apparmor_profile`].
+    #[serde(skip)]
+    pub apparmor_restricts_unconfined: bool,
 }
 
 impl Facts {
+    /// The AppArmor profile containerd must find loaded on this host, if it needs one.
+    #[must_use]
+    pub fn apparmor_profile(&self) -> Option<HostFile> {
+        self.apparmor_restricts_unconfined
+            .then(cluster::apparmor_profile)
+    }
+
     /// The name this host has as a node: [`Self::node_name`], else the host name in lower case,
     /// as K3s, RKE2 and `KubeSolo` name a node they are not told the name of.
     #[must_use]
@@ -267,6 +280,9 @@ pub struct ComponentPlan {
     pub health: Vec<Health>,
     /// Measured idle memory.
     pub idle_memory_mib: Option<u64>,
+    /// The catalog's `testedOn` does not name the distribution and the node's platform.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub untested: bool,
     /// The catalog's one-line security summary.
     pub security: String,
     /// The component's `NetworkPolicy` objects, labelled as the installer's, applied before its
@@ -373,6 +389,8 @@ pub struct IdentityPlan {
     pub host: String,
     /// Image reference.
     pub image: String,
+    /// The pinned release; `None` when `sources.identityImage` replaces it.
+    pub version: Option<String>,
     /// The `zeabur-identityctl` binary, or its release archive.
     pub identityctl: Source,
     /// The Ingress exposing it.
@@ -389,6 +407,8 @@ pub struct ZeaburPlan {
     pub url: String,
     /// The chart: a local directory or `.tgz`, or the released `.tgz`.
     pub chart: Source,
+    /// The pinned release; `None` when `sources.zeaburImage` or `sources.zeaburChart` replaces it.
+    pub version: Option<String>,
     /// Helm values, except the generated Secrets' names, which are fixed.
     pub values: Value,
 }
@@ -410,12 +430,70 @@ pub struct Memory {
     pub reserved_mib: Option<u64>,
 }
 
-/// The least memory a team install on `distribution` needs for a component that uses memory on
-/// top of its idle use while working.
+/// What the components `ids` ask the scheduler for on `distribution`: the catalog's measurement on
+/// the distribution itself, or on kind's `single-node` where it has none.
+fn requests_mib<'a>(
+    index: &Index,
+    ids: impl IntoIterator<Item = &'a str>,
+    distribution: Distribution,
+    arch: &str,
+) -> u64 {
+    ids.into_iter()
+        .filter_map(|id| index.component(id))
+        .filter_map(|c| {
+            c.request_memory_mib(distribution.id(), "single-node", arch)
+                .or_else(|| c.request_memory_mib(KIND, "single-node", arch))
+        })
+        .sum()
+}
+
+/// What Zeabur Identity's pods request, as its pinned release gives it; a development build names
+/// its own image and has no such figure.
+fn identity_request_mib(products: Option<&pins::Products>) -> u64 {
+    products.map_or(0, |p| p.identity.request_memory_mib)
+}
+
+/// The least memory a team install of `ids` on `distribution` needs: the components that do no
+/// work of their own, which are never left out for memory, and Zeabur Identity.
 #[must_use]
-pub fn min_memory_mib(component: &Component, distribution: Distribution) -> Option<u64> {
-    let work = component.resources.work_memory_mib?;
-    Some(distribution.min_memory_at_work_mib(work))
+pub fn team_min_memory_mib(
+    index: &Index,
+    ids: &[&str],
+    distribution: Distribution,
+    arch: &str,
+    products: Option<&pins::Products>,
+) -> u64 {
+    let idle = ids.iter().copied().filter(|id| {
+        index
+            .component(id)
+            .is_some_and(|c| c.resources.work_mib().is_none())
+    });
+    distribution.min_memory_mib(
+        requests_mib(index, idle, distribution, arch) + identity_request_mib(products),
+    )
+}
+
+/// The least memory a team install of `ids` on `distribution` needs for `component`, which uses
+/// memory on top of its idle use while working: every one of them installed, with one piece of
+/// its work running.
+#[must_use]
+pub fn min_memory_mib(
+    component: &Component,
+    index: &Index,
+    ids: &[&str],
+    distribution: Distribution,
+    arch: &str,
+    products: Option<&pins::Products>,
+) -> Option<u64> {
+    let work = component.resources.work_mib()?;
+    let installed = ids
+        .iter()
+        .copied()
+        .filter(|id| *id != component.id)
+        .chain([component.id.as_str()]);
+    Some(distribution.min_memory_mib(
+        requests_mib(index, installed, distribution, arch) + identity_request_mib(products) + work,
+    ))
 }
 
 /// The selection without the components one build or other work would not fit beside, and the
@@ -428,17 +506,26 @@ fn select_fitting(
     index: &Index,
     config: &Config,
     facts: &Facts,
+    products: Option<&pins::Products>,
 ) -> Result<(Selection, BTreeMap<String, String>), PlanError> {
     let distribution = config.distribution;
+    let arch = facts.arch.as_str();
+    let mut selection = select::select(index, config, &Target::team(config, arch))?;
+    let ids: Vec<String> = selection
+        .components
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let min = team_min_memory_mib(index, &ids, distribution, arch, products);
     // An install that is already running is upgraded with a warning instead.
-    if facts.record.is_none() && facts.memory_mib < distribution.min_memory_mib() {
+    if facts.record.is_none() && facts.memory_mib < min {
         return Err(PlanError::TeamMemory {
             distribution,
-            min: distribution.min_memory_mib(),
+            min,
             have: facts.memory_mib,
         });
     }
-    let mut selection = select::select(index, config)?;
     let mut left_out = select::reasons(&selection.left_out);
     crate::personal::leave_out_short_of_memory(
         index,
@@ -450,7 +537,7 @@ fn select_fitting(
                 .record
                 .as_ref()
                 .is_some_and(|r| r.components.contains(&c.id));
-            min_memory_mib(c, config.distribution).filter(|_| !installed)
+            min_memory_mib(c, index, &ids, distribution, arch, products).filter(|_| !installed)
         },
     );
     Ok((selection, left_out))
@@ -461,14 +548,24 @@ fn below_minimum(
     index: &Index,
     selection: &Selection,
     distribution: Distribution,
-    host_mib: u64,
+    facts: &Facts,
+    products: Option<&pins::Products>,
 ) -> Option<Warning> {
-    let needs = selection
+    let host_mib = facts.memory_mib;
+    let arch = facts.arch.as_str();
+    let ids: Vec<&str> = selection
         .components
         .iter()
-        .filter_map(|(id, _)| index.component(id))
-        .filter_map(|c| min_memory_mib(c, distribution))
-        .fold(distribution.min_memory_mib(), u64::max);
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let needs = ids
+        .iter()
+        .filter_map(|id| index.component(id))
+        .filter_map(|c| min_memory_mib(c, index, &ids, distribution, arch, products))
+        .fold(
+            team_min_memory_mib(index, &ids, distribution, arch, products),
+            u64::max,
+        );
     let title = distribution.title();
     (host_mib < needs).then(|| {
         warning(
@@ -507,7 +604,7 @@ pub fn plan_with(
     let distribution = config.distribution;
     facts.check_installer()?;
     let node_name = node_name::choose(config.host.node_name.as_deref(), facts, &[])?;
-    let (selection, left_out) = select_fitting(index, config, facts)?;
+    let (selection, left_out) = select_fitting(index, config, facts, products)?;
     let profile = config.profile.as_str();
     let chosen: BTreeSet<&str> = selection
         .components
@@ -519,7 +616,8 @@ pub fn plan_with(
         index,
         &selection,
         distribution,
-        facts.memory_mib,
+        facts,
+        products,
     ));
 
     let cluster = cluster_plan(distribution, config.version(), &facts.arch, &mut warnings)?;
@@ -548,7 +646,7 @@ pub fn plan_with(
         for plan in &mut components {
             if let Some(mib) = index
                 .component(&plan.id)
-                .and_then(|c| c.idle_memory_mib(distribution.id(), &facts.arch))
+                .and_then(|c| c.idle_memory_mib(distribution.id(), "single-node", &facts.arch))
             {
                 plan.idle_memory_mib = Some(mib);
             }
@@ -576,16 +674,15 @@ pub fn plan_with(
     let host_files = server_files(config, &chosen, facts, &node_name, registry.as_ref());
 
     let memory = memory(distribution, &components, facts.memory_mib, &mut warnings);
-    let changes = facts
-        .record
-        .as_ref()
-        .map(|r| Changes::new(r, index, &components, &cluster.version));
-    warnings.extend(
-        facts
-            .record
-            .as_ref()
-            .and_then(|r| crate::record::builder_deletes_images(r, &components)),
-    );
+    let changes = facts.record.as_ref().map(|r| {
+        let planned = Planned {
+            components: &components,
+            version: &cluster.version,
+            identity: identity.as_ref(),
+            zeabur: zeabur.as_ref(),
+        };
+        Changes::new(r, index, planned)
+    });
 
     Ok(Plan {
         storage: storage_plan(&components, profile, &mut warnings),
@@ -712,6 +809,7 @@ fn products(
         );
     }
     let sources = &config.sources;
+    let (identity_version, zeabur_version) = pinned_versions(sources, pins);
     let image = sources
         .identity_image
         .clone()
@@ -747,6 +845,7 @@ fn products(
         issuer: config.issuer(),
         host: config.access.identity.clone(),
         image,
+        version: identity_version,
         identityctl,
         ingress: ingress(
             IDENTITY_NAMESPACE,
@@ -756,6 +855,29 @@ fn products(
         ),
         invitations: config.access.invitations,
     };
+    product_warnings(config, chosen, warnings);
+    let suffixes = suffixes(config, facts);
+    warn_no_suffixes(config, facts, &suffixes, warnings);
+    let mut values = zeabur_values(config, facts, tls_issuer, &zeabur_image, &suffixes);
+    chosen_values(
+        chosen,
+        registry,
+        sources.proxy_image.as_deref(),
+        &mut values,
+    );
+    Ok((
+        Some(identity),
+        Some(ZeaburPlan {
+            url: config.zeabur_url(),
+            chart,
+            version: zeabur_version,
+            values,
+        }),
+    ))
+}
+
+/// What Zeabur misses without metrics, and what local access needs from DNS.
+fn product_warnings(config: &Config, chosen: &BTreeSet<&str>, warnings: &mut Vec<Warning>) {
     // The chart reads usage history from the catalog's VictoriaMetrics by default.
     if !chosen.contains(VICTORIA_METRICS) {
         warnings.push(warning(
@@ -776,23 +898,23 @@ fn products(
             ),
         ));
     }
-    let suffixes = suffixes(config, facts);
-    warn_no_suffixes(config, facts, &suffixes, warnings);
-    let mut values = zeabur_values(config, facts, tls_issuer, &zeabur_image, &suffixes);
-    chosen_values(
-        chosen,
-        registry,
-        sources.proxy_image.as_deref(),
-        &mut values,
-    );
-    Ok((
-        Some(identity),
-        Some(ZeaburPlan {
-            url: config.zeabur_url(),
-            chart,
-            values,
-        }),
-    ))
+}
+
+/// The pinned Zeabur Identity and Zeabur releases, each `None` when `sources` replaces it.
+fn pinned_versions(
+    sources: &Sources,
+    pins: Option<&pins::Products>,
+) -> (Option<String>, Option<String>) {
+    let Some(pins) = pins else {
+        return (None, None);
+    };
+    let identity = sources
+        .identity_image
+        .is_none()
+        .then(|| pins.identity.version.to_owned());
+    let zeabur = (sources.zeabur_image.is_none() && sources.zeabur_chart.is_none())
+        .then(|| pins.zeabur.version.to_owned());
+    (identity, zeabur)
 }
 
 /// The chart values that follow from the chosen components.
@@ -980,7 +1102,7 @@ pub(crate) struct Choices<'a> {
 /// Service address.
 #[must_use]
 pub fn installer_fills(input: &Input) -> bool {
-    input.generate.as_deref() == Some("clusterIP")
+    input.generate == Some(Generate::ClusterIp)
 }
 
 /// The value of an input the installer knows; a configured value wins over it.
@@ -1018,17 +1140,16 @@ pub(crate) fn components(
             .components
             .iter()
             .filter(|c| {
-                chosen.contains(c.id.as_str()) && c.contributes.iter().any(|x| x.target == *id)
+                chosen.contains(c.id.as_str())
+                    && c.contributes.iter().any(|x| x.target.component == *id)
             })
             .collect();
-        components.push(component_plan(
-            component,
-            *why,
-            &contributors,
-            choices,
-            profile,
-            arch,
-        )?);
+        let mut plan = component_plan(component, *why, &contributors, choices, profile, arch)?;
+        plan.untested = selection
+            .warnings
+            .iter()
+            .any(|w| select::is_untested(w) && w.values.first() == Some(id));
+        components.push(plan);
         let privileged = privileged(component, choices);
         let baseline = baseline(component);
         for release in &component.releases {
@@ -1068,89 +1189,96 @@ fn component_plan(
     let mut releases = Vec::new();
     for release in &component.releases {
         let name = release.release_name().to_owned();
-        if let Some(chart) = &release.chart {
-            let mut vals = values::parse(
-                release.values.as_deref().unwrap_or(""),
-                &format!("{id} {name}"),
-            )?;
-            if let Some(over) = release.profiles.as_ref().and_then(|p| p.get(profile)) {
-                values::merge(
-                    &mut vals,
-                    values::parse(over, &format!("{id} {name} {profile}"))?,
-                );
-            }
-            for contributor in contributors {
-                for c in contributor
-                    .contributes
-                    .iter()
-                    .filter(|c| c.target == id && c.release == release.name)
-                {
+        match (release.kind, &release.chart, &release.manifests) {
+            (ReleaseType::Helm, Some(chart), _) => {
+                let mut vals = values::parse(
+                    release.values.as_deref().unwrap_or(""),
+                    &format!("{id} {name}"),
+                )?;
+                if let Some(over) = release.profiles.as_ref().and_then(|p| p.get(profile)) {
                     values::merge(
                         &mut vals,
-                        values::parse(&c.values, &format!("{} → {id}", contributor.id))?,
+                        values::parse(over, &format!("{id} {name} {profile}"))?,
                     );
                 }
+                for contributor in contributors {
+                    for c in contributor
+                        .contributes
+                        .iter()
+                        .filter(|c| c.target.component == id && c.target.release == release.name)
+                    {
+                        values::merge(
+                            &mut vals,
+                            values::parse(&c.values, &format!("{} → {id}", contributor.id))?,
+                        );
+                    }
+                }
+                for (_, path, value) in paths.iter().filter(|(r, ..)| *r == release.name) {
+                    values::set_path(&mut vals, path, value.clone())?;
+                }
+                let mut spec = json!({
+                    "chart": chart,
+                    "version": release.version,
+                    "targetNamespace": release.namespace,
+                    "createNamespace": false,
+                    "valuesContent": values::canonical(&vals),
+                    "failurePolicy": "abort",
+                    "timeout": "10m0s",
+                });
+                if let (Some(repo), Some(map)) = (&release.repo, spec.as_object_mut()) {
+                    map.insert("repo".to_owned(), json!(repo));
+                }
+                releases.push(ReleasePlan::HelmChart {
+                    object: helm_chart(&name, id, &spec),
+                    name,
+                    digest: release.chart_digest.clone(),
+                });
             }
-            for (_, path, value) in paths.iter().filter(|(r, ..)| *r == release.name) {
-                values::set_path(&mut vals, path, value.clone())?;
+            (ReleaseType::Inline, _, Some(yaml)) => {
+                releases.push(ReleasePlan::Manifests {
+                    name,
+                    namespace: release.namespace.clone(),
+                    yaml: yaml.clone(),
+                });
             }
-            let mut spec = json!({
-                "chart": chart,
-                "version": release.version,
-                "targetNamespace": release.namespace,
-                "createNamespace": false,
-                "valuesContent": values::canonical(&vals),
-                "failurePolicy": "abort",
-                "timeout": "10m0s",
-            });
-            if let (Some(repo), Some(map)) = (&release.repo, spec.as_object_mut()) {
-                map.insert("repo".to_owned(), json!(repo));
+            (ReleaseType::Manifest, ..) => {
+                let version = release.version.clone().unwrap_or_default();
+                #[expect(
+                    clippy::literal_string_with_formatting_args,
+                    reason = "the catalog's placeholder"
+                )]
+                let placeholder = "{version}";
+                releases.push(ReleasePlan::Urls {
+                    name,
+                    namespace: release.namespace.clone(),
+                    urls: release
+                        .urls
+                        .iter()
+                        .map(|u| u.replace(placeholder, &version))
+                        .collect(),
+                    digests: release.url_digests.clone(),
+                    skip_if_present: release.skip_if_present.clone(),
+                });
             }
-            releases.push(ReleasePlan::HelmChart {
-                object: helm_chart(&name, id, &spec),
-                name,
-                digest: release.chart_digest.clone(),
-            });
-        } else if let Some(yaml) = &release.manifests {
-            releases.push(ReleasePlan::Manifests {
-                name,
-                namespace: release.namespace.clone(),
-                yaml: yaml.clone(),
-            });
-        } else {
-            let version = release.version.clone().unwrap_or_default();
-            #[expect(
-                clippy::literal_string_with_formatting_args,
-                reason = "the catalog's placeholder"
-            )]
-            let placeholder = "{version}";
-            releases.push(ReleasePlan::Urls {
-                name,
-                namespace: release.namespace.clone(),
-                urls: release
-                    .urls
-                    .iter()
-                    .map(|u| u.replace(placeholder, &version))
-                    .collect(),
-                digests: release.url_digests.clone(),
-                skip_if_present: release.skip_if_present.clone(),
-            });
+            (ReleaseType::Helm | ReleaseType::Inline | ReleaseType::Unknown, ..) => {
+                return Err(PlanError::Values {
+                    what: format!("{id} {name}"),
+                    reason: "a release this installer cannot read".to_owned(),
+                });
+            }
         }
     }
 
     Ok(ComponentPlan {
         id: id.to_owned(),
         display_name: component.metadata.name.clone(),
-        why: match why {
-            Why::Default => "default",
-            Why::Enabled => "enabled",
-            Why::Dependency => "dependency",
-        },
+        why: why.name(),
         secrets,
         releases,
         contributed_by: contributors.iter().map(|c| c.id.clone()).collect(),
         health: component.health.clone(),
-        idle_memory_mib: component.idle_memory_mib(profile, arch),
+        idle_memory_mib: component.idle_memory_mib(KIND, profile, arch),
+        untested: false,
         security: component.security.summary.clone(),
         network_policies: network_policies(component)?,
     })
@@ -1189,7 +1317,7 @@ fn inputs(component: &Component, choices: &Choices<'_>) -> Result<Inputs, PlanEr
     let first_chart = component
         .releases
         .iter()
-        .find(|r| r.chart.is_some())
+        .find(|r| r.kind == ReleaseType::Helm)
         .map(|r| r.name.clone());
     let given = choices.inputs.get(id);
     let files = choices.secret_files.get(id);
@@ -1199,17 +1327,18 @@ fn inputs(component: &Component, choices: &Choices<'_>) -> Result<Inputs, PlanEr
         if let Some(secret) = &input.secret {
             let source = match files.and_then(|f| f.get(&input.name)) {
                 Some(path) => SecretSource::File(path.clone()),
-                None if input.generate.as_deref() == Some("random") => SecretSource::Generate {
-                    bytes: input.generate_bytes.unwrap_or(64),
-                    encoding: input.generate_encoding,
+                None => match input.generate {
+                    Some(Generate::Random { bytes, encoding }) => {
+                        SecretSource::Generate { bytes, encoding }
+                    }
+                    Some(Generate::ClusterIp | Generate::Unknown) | None => {
+                        return Err(PlanError::MissingInput {
+                            component: id.to_owned(),
+                            input: input.name.clone(),
+                            hint: format!("secretFiles.{id}.{}: <file, mode 0600>", input.name),
+                        });
+                    }
                 },
-                None => {
-                    return Err(PlanError::MissingInput {
-                        component: id.to_owned(),
-                        input: input.name.clone(),
-                        hint: format!("secretFiles.{id}.{}: <file, mode 0600>", input.name),
-                    });
-                }
             };
             secrets.push(SecretPlan {
                 secret: secret_ref(secret),
@@ -1228,7 +1357,7 @@ fn inputs(component: &Component, choices: &Choices<'_>) -> Result<Inputs, PlanEr
                 .unwrap_or_default();
             match value {
                 Some(value) => paths.push((release, path.clone(), value)),
-                None if input.required => {
+                None if input.required || input.generate == Some(Generate::Unknown) => {
                     return Err(PlanError::MissingInput {
                         component: id.to_owned(),
                         input: input.name.clone(),
@@ -1249,24 +1378,22 @@ fn inputs(component: &Component, choices: &Choices<'_>) -> Result<Inputs, PlanEr
 fn privileged(component: &Component, choices: &Choices<'_>) -> Option<String> {
     let id = &component.id;
     if id == "volume-backup/velero" {
-        // Only its node agent needs the level, and the `file-backup` input installs it.
+        // Only its node agent needs the level, and the `fileBackup` input installs it.
         let agent = choices
             .inputs
             .get(id)
-            .and_then(|given| given.get("file-backup"))
+            .and_then(|given| given.get("fileBackup"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         return agent.then(|| format!("{id}: its node agent mounts host paths and runs as root"));
     }
-    component
-        .security
-        .privileged
+    (component.security.level == PodSecurity::Privileged)
         .then(|| format!("{id}: {}", component.security.summary.trim()))
 }
 
 /// Why a component's namespaces need the `baseline` Pod Security level, if they do.
 fn baseline(component: &Component) -> Option<String> {
-    (component.security.level.as_deref() == Some("baseline")).then(|| {
+    (component.security.level == PodSecurity::Baseline).then(|| {
         format!(
             "{}: its pods set no seccomp profile or dropped capabilities",
             component.id
@@ -1290,6 +1417,7 @@ fn server_files(
     });
     files.push(distribution.node_name_file(node_name));
     files.extend(distribution.node_ip_file(&facts.node_ips));
+    files.extend(facts.apparmor_profile());
     files.extend(
         registry
             .and_then(|r| Some(distribution.registries_file(&r.host, r.cluster_ip.as_deref()?))),
@@ -1400,44 +1528,75 @@ const CALICO_TUNNEL_ANNOTATIONS: [&str; 2] = [
     "projectcalico.org/IPv6VXLANTunnelAddr",
 ];
 
+/// A Ready node whose VXLAN address is not known yet, by name. Calico writes its annotation a few
+/// seconds after the node turns Ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeWaiting(pub String);
+
 /// The addresses node traffic comes from, read from `kubectl get nodes -o json`.
 ///
-/// A node's traffic to pods on other nodes leaves from its VXLAN interface. Calico (K3s) names
-/// that interface's address in an annotation; Canal (RKE2) gives it the first address of the
-/// node's pod range. A node's traffic to its own pods passes without a rule. Sorted and without
-/// repeats.
-#[must_use]
-pub fn node_sources(nodes: &Value) -> Vec<String> {
+/// A node's traffic to pods on other nodes leaves from its VXLAN interface. On K3s, Calico names
+/// that interface's address in an annotation; on RKE2, Canal gives it the first address of the
+/// node's pod range. A node that is not Ready carries no pod traffic and is left out; a Ready node
+/// without its address yet is [`NodeWaiting`]. A node's traffic to its own pods passes without a
+/// rule. Sorted and without repeats.
+///
+/// # Errors
+///
+/// [`NodeWaiting`] for the first Ready node whose address is not known yet.
+pub fn node_sources(distribution: Distribution, nodes: &Value) -> Result<Vec<String>, NodeWaiting> {
     let mut found = BTreeSet::new();
-    for node in nodes
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let calico: Vec<String> = CALICO_TUNNEL_ANNOTATIONS
-            .iter()
-            .filter_map(|key| {
-                node.pointer("/metadata/annotations")
-                    .and_then(|a| a.get(*key))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect();
-        if calico.is_empty() {
-            found.extend(
-                node.pointer("/spec/podCIDRs")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .filter_map(|cidr| cidr.split_once('/').map(|(base, _)| base.to_owned())),
-            );
-        } else {
-            found.extend(calico);
+    let items = nodes.get("items").and_then(Value::as_array);
+    for node in items.into_iter().flatten() {
+        if !is_ready(node) {
+            continue;
+        }
+        let addresses = match distribution {
+            Distribution::K3s => calico_vxlan_addresses(node),
+            Distribution::Rke2 => canal_vxlan_addresses(node),
+        };
+        if addresses.is_empty() {
+            let name = node.pointer("/metadata/name").and_then(Value::as_str);
+            return Err(NodeWaiting(name.unwrap_or_default().to_owned()));
+        }
+        found.extend(addresses);
+    }
+    Ok(found.into_iter().collect())
+}
+
+/// Whether the node's `Ready` condition is `True`.
+fn is_ready(node: &Value) -> bool {
+    let conditions = node.pointer("/status/conditions").and_then(Value::as_array);
+    for condition in conditions.into_iter().flatten() {
+        if condition.get("type").and_then(Value::as_str) == Some("Ready") {
+            return condition.get("status").and_then(Value::as_str) == Some("True");
         }
     }
-    found.into_iter().collect()
+    false
+}
+
+fn calico_vxlan_addresses(node: &Value) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for key in CALICO_TUNNEL_ANNOTATIONS {
+        let address = node
+            .pointer("/metadata/annotations")
+            .and_then(|a| a.get(key));
+        if let Some(address) = address.and_then(Value::as_str) {
+            addresses.push(address.to_owned());
+        }
+    }
+    addresses
+}
+
+fn canal_vxlan_addresses(node: &Value) -> Vec<String> {
+    let mut addresses = Vec::new();
+    let cidrs = node.pointer("/spec/podCIDRs").and_then(Value::as_array);
+    for cidr in cidrs.into_iter().flatten().filter_map(Value::as_str) {
+        if let Some((base, _)) = cidr.split_once('/') {
+            addresses.push(base.to_owned());
+        }
+    }
+    addresses
 }
 
 /// The `ipBlock` sources of a baseline policy, as `network_policy` writes them.
@@ -1618,7 +1777,7 @@ pub fn is_public(address: &str) -> bool {
     }
 }
 
-/// The chart values of docs/get-started/install.mdx, with the Secrets the installer creates.
+/// The chart values of docs/install/existing-cluster.mdx, with the Secrets the installer creates.
 /// The chart's `image` values for a reference: repository with a tag or a digest.
 fn image_values(image: &str) -> Value {
     let (repository, digest) = image
@@ -1675,7 +1834,6 @@ fn zeabur_values(
 mod tests {
     use super::*;
     use crate::record;
-    const INDEX: &str = include_str!(concat!(env!("ZEABUR_CATALOG_RELEASE"), "/index.json"));
 
     fn config(extra: &str) -> Config {
         Config::parse(&format!(
@@ -1696,6 +1854,7 @@ mod tests {
             node_ips: vec!["10.0.0.5".to_owned()],
             record: None,
             installer: None,
+            apparmor_restricts_unconfined: false,
         }
     }
 
@@ -1724,7 +1883,7 @@ mod tests {
 
     #[test]
     fn a_stopped_cluster_last_applied_by_a_newer_installer_is_left_alone() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let stopped = Facts {
             installer: Some("99.0.0".to_owned()),
             ..facts()
@@ -1742,10 +1901,13 @@ mod tests {
 
     #[test]
     fn defaults_follow_the_catalog_and_leave_out_components_of_another_distribution() {
-        let mut index = Index::parse(INDEX.as_bytes()).unwrap();
+        let mut index = crate::catalog::pinned();
         for component in &mut index.components {
             if component.id == "node-updates/system-upgrade-controller" {
                 component.distributions = vec!["rke2".to_owned()];
+                for default in component.defaults.values_mut() {
+                    *default = crate::catalog::Default::Recommended;
+                }
             }
         }
         let plan = plan(&index, &config(""), &facts()).unwrap();
@@ -1794,7 +1956,7 @@ mod tests {
 
     #[test]
     fn the_server_is_named_in_its_k3s_configuration() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let named = |extra: &str, facts: &Facts| {
             let plan = plan(&index, &config(extra), facts)?;
             let file = plan
@@ -1825,13 +1987,13 @@ mod tests {
 
     #[test]
     fn velero_needs_the_privileged_level_only_for_its_node_agent() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let level = |extra: &str| {
             let plan = plan(
                 &index,
                 &config(&format!(
                     "enable: [volume-backup/velero]\ninputs:\n  volume-backup/velero:\n    \
-                     bucket: b\n    s3-url: http://s3:9000\n{extra}\
+                     bucket: b\n    s3Url: http://s3:9000\n{extra}\
                      secretFiles:\n  volume-backup/velero:\n    credentials: /tmp/c\n"
                 )),
                 &facts(),
@@ -1843,18 +2005,18 @@ mod tests {
                 .map(|n| n.privileged.is_some())
         };
         assert_eq!(level(""), Some(false));
-        assert_eq!(level("    file-backup: true\n"), Some(true));
+        assert_eq!(level("    fileBackup: true\n"), Some(true));
     }
 
     #[test]
     fn velero_takes_the_buckets_region() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let values = |extra: &str| {
             let plan = plan(
                 &index,
                 &config(&format!(
                     "enable: [volume-backup/velero]\ninputs:\n  volume-backup/velero:\n    \
-                     bucket: b\n    s3-url: https://r2.example.com\n{extra}\
+                     bucket: b\n    s3Url: https://r2.example.com\n{extra}\
                      secretFiles:\n  volume-backup/velero:\n    credentials: /tmp/c\n"
                 )),
                 &facts(),
@@ -1877,7 +2039,7 @@ mod tests {
 
     #[test]
     fn k8up_namespace_gets_the_baseline_level() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let plan = plan(&index, &config("enable: [volume-backup/k8up]\n"), &facts()).unwrap();
         let k8up = plan
             .namespaces
@@ -1889,7 +2051,7 @@ mod tests {
 
     #[test]
     fn multi_node_makes_longhorn_the_default_and_installs_it_first() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let plan = plan(&index, &config("profile: multi-node\n"), &facts()).unwrap();
         assert_eq!(ids(&plan)[0], storage::LONGHORN);
         assert_eq!(plan.storage.default_class, "longhorn");
@@ -1922,7 +2084,7 @@ mod tests {
     // source NAT: https://github.com/k3s-io/k3s/blob/master/pkg/cloudprovider/servicelb.go
     #[test]
     fn traefik_keeps_client_addresses_behind_servicelb_on_k3s_and_rke2() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         for distribution in ["k3s", "rke2"] {
             for profile in ["single-node", "multi-node"] {
                 let extra = format!("distribution: {distribution}\nprofile: {profile}\n");
@@ -1952,7 +2114,7 @@ mod tests {
 
     #[test]
     fn longhorn_on_one_node_leaves_local_path_the_default() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let plan = plan(&index, &config("enable: [replicated-storage]\n"), &facts()).unwrap();
         assert!(ids(&plan).contains(&storage::LONGHORN));
         assert_eq!(plan.storage.default_class, "local-path");
@@ -1967,7 +2129,7 @@ mod tests {
 
     #[test]
     fn plans_are_deterministic() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let a = serde_json::to_string(&plan(&index, &config(SECURE), &facts()).unwrap()).unwrap();
         let b = serde_json::to_string(&plan(&index, &config(SECURE), &facts()).unwrap()).unwrap();
         assert_eq!(a, b);
@@ -1975,7 +2137,7 @@ mod tests {
 
     #[test]
     fn crowdsec_contributes_to_traefik_and_generates_its_secrets() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let plan = plan(&index, &config(SECURE), &facts()).unwrap();
         let traefik = plan
             .components
@@ -2009,7 +2171,7 @@ mod tests {
 
     #[test]
     fn disabling_ingress_stops_the_plan() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let err = plan(&index, &config("disable: [ingress]\n"), &facts()).unwrap_err();
         assert!(matches!(err, PlanError::NeedsDisabled { .. }), "{err}");
     }
@@ -2031,7 +2193,7 @@ mod tests {
 
     #[test]
     fn nodes_pull_from_the_registry_through_its_fixed_address() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let without = plan(&index, &config("disable: [builds]\n"), &facts()).unwrap();
         assert_eq!(without.registry, None);
         let k3s = Distribution::K3s;
@@ -2081,7 +2243,7 @@ mod tests {
 
     #[test]
     fn required_inputs_name_the_line_to_add() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let err = plan(
             &index,
             &config("enable: [volume-backup/velero]\n"),
@@ -2094,7 +2256,7 @@ mod tests {
             &index,
             &config(
                 "enable: [volume-backup/velero]\ninputs:\n  volume-backup/velero:\n    \
-                 bucket: backups\n    s3-url: https://s3.example.com\nsecretFiles:\n  \
+                 bucket: backups\n    s3Url: https://s3.example.com\nsecretFiles:\n  \
                  volume-backup/velero:\n    credentials: /root/velero-credentials\n",
             ),
             &facts(),
@@ -2116,7 +2278,7 @@ mod tests {
 
     #[test]
     fn another_release_is_a_warning_not_an_error() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         for extra in [
             "distribution: rke2\nrke2Version: v1.37.1+rke2r1\n",
             "k3sVersion: v1.37.1+k3s1\n",
@@ -2140,7 +2302,7 @@ mod tests {
 
     #[test]
     fn k3s_comes_with_its_binary_images_and_pinned_install_script() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let p = plan(&index, &config(""), &facts()).unwrap();
         let files: Vec<&str> = p.cluster.downloads().map(|d| d.file.as_str()).collect();
         assert_eq!(
@@ -2163,7 +2325,7 @@ mod tests {
 
     #[test]
     fn the_record_carries_the_catalog_health_checks() {
-        let mut index = Index::parse(INDEX.as_bytes()).unwrap();
+        let mut index = crate::catalog::pinned();
         let check = Health {
             name: "ready".to_owned(),
             wait: [
@@ -2206,20 +2368,27 @@ mod tests {
     fn untested_on(index: &mut Index, id: &str, distribution: &str) {
         for component in &mut index.components {
             if component.id == id {
-                component.tested_on.retain(|d| d != distribution);
+                component
+                    .tested_on
+                    .retain(|t| t.distribution != distribution);
             }
         }
     }
 
     #[test]
-    fn a_default_component_not_tested_on_the_distribution_is_left_out() {
-        let mut index = Index::parse(INDEX.as_bytes()).unwrap();
+    fn a_default_component_not_tested_on_the_distribution_is_installed_with_a_warning() {
+        let mut index = crate::catalog::pinned();
         untested_on(&mut index, "image-updates/keel", "rke2");
         let rke2 = plan(&index, &config("distribution: rke2\n"), &facts()).unwrap();
-        assert!(!ids(&rke2).contains(&"image-updates/keel"));
-        assert_eq!(rke2.left_out["image-updates/keel"], "not tested on rke2");
+        assert!(ids(&rke2).contains(&"image-updates/keel"));
+        assert!(
+            rke2.warnings
+                .iter()
+                .any(|w| w.code == "config.untested" && w.values == ["image-updates/keel", "rke2"])
+        );
         let k3s = plan(&index, &config(""), &facts()).unwrap();
         assert!(ids(&k3s).contains(&"image-updates/keel"));
+        assert!(k3s.warnings.iter().all(|w| w.code != "config.untested"));
     }
 
     #[test]
@@ -2271,23 +2440,22 @@ mod tests {
     }
 
     #[test]
-    fn node_traffic_sources() {
+    fn canal_nodes_are_the_first_address_of_their_pod_range() {
         let nodes = json!({"items": [
             {"spec": {"podCIDRs": ["10.42.0.0/24"]},
-             "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"},
-                                      {"type": "Hostname", "address": "vps-1"}]}},
+             "status": {"conditions": [{"type": "Ready", "status": "True"}]}},
             {"spec": {"podCIDRs": ["10.42.1.0/24", "fd00:42:0:1::/64"]},
-             "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.6"}]}},
+             "status": {"conditions": [{"type": "Ready", "status": "True"}]}},
         ]});
         assert_eq!(
-            node_sources(&nodes),
+            node_sources(Distribution::Rke2, &nodes).unwrap(),
             ["10.42.0.0", "10.42.1.0", "fd00:42:0:1::"]
         );
     }
 
     #[test]
     fn products_only_are_what_the_plan_installs() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let none = "disable: [logs/victoria-logs, metrics/victoria-metrics, builds]\n";
         let p = plan(&index, &config(none), &facts()).unwrap();
         assert_eq!(
@@ -2298,7 +2466,7 @@ mod tests {
 
     #[test]
     fn zeabur_values_match_the_chart() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let p = plan(&index, &config(""), &facts()).unwrap();
         let values = &p.zeabur.unwrap().values;
         assert_eq!(
@@ -2316,7 +2484,7 @@ mod tests {
 
     #[test]
     fn zeabur_reads_history_through_its_proxy_when_a_store_is_installed() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let values = |disable: &str| {
             plan(&index, &config(disable), &facts())
                 .unwrap()
@@ -2339,7 +2507,7 @@ mod tests {
 
     #[test]
     fn proxy_image_source_replaces_the_charts_proxy_image() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let values = |extra: &str| {
             plan(&index, &config(extra), &facts())
                 .unwrap()
@@ -2370,7 +2538,7 @@ mod tests {
 
     #[test]
     fn zeabur_reads_images_from_the_registry_only_when_one_is_installed() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let without = plan(&index, &config("disable: [builds]\n"), &facts()).unwrap();
         assert!(without.zeabur.unwrap().values.get("builds").is_none());
         let with = plan(&index, &config(""), &facts()).unwrap();
@@ -2400,7 +2568,7 @@ mod tests {
 
     #[test]
     fn a_components_network_policies_are_the_installers_and_go_with_it() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let plan = plan(&index, &config(""), &facts()).unwrap();
         let policies: Vec<&Value> = plan
             .components
@@ -2425,7 +2593,7 @@ mod tests {
 
     #[test]
     fn suffixes_default_to_sslip_for_a_public_address() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let mut public = facts();
         public.node_ips = vec!["203.0.114.7".to_owned(), "2a01:4f8::1".to_owned()];
         let p = plan(&index, &config(""), &public).unwrap();
@@ -2478,6 +2646,7 @@ mod tests {
                 image: "ghcr.io/zeabur-oss/identity@sha256:bb",
                 identityctl_amd64: "cc",
                 identityctl_arm64: "dd",
+                request_memory_mib: 24,
             },
             zeabur: pins::Zeabur {
                 version: "v0.3.0",
@@ -2536,15 +2705,32 @@ mod tests {
         assert_eq!(keys, ["identityImage", "identityctl", "zeaburChart"]);
     }
 
+    /// The least memory a team install of `config` needs, as the plan checks it.
+    fn least_memory(index: &Index, config: &Config) -> u64 {
+        let selection = select::select(index, config, &Target::team(config, "arm64")).unwrap();
+        let ids: Vec<&str> = selection
+            .components
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        team_min_memory_mib(
+            index,
+            &ids,
+            config.distribution,
+            "arm64",
+            pins::PRODUCTS.as_ref(),
+        )
+    }
+
     #[test]
     fn a_team_install_needs_the_least_memory() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         for (distribution, extra) in [
             (Distribution::K3s, ""),
             (Distribution::Rke2, "distribution: rke2\n"),
         ] {
             let mut small = facts();
-            small.memory_mib = distribution.min_memory_mib();
+            small.memory_mib = least_memory(&index, &config(extra));
             assert!(plan(&index, &config(extra), &small).is_ok());
             small.memory_mib -= 1;
             let Err(error) = plan(&index, &config(extra), &small) else {
@@ -2556,24 +2742,8 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_fit_the_smallest_servers_without_a_warning() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
-        for (extra, memory_mib) in [
-            ("", Distribution::K3s.min_memory_mib()),
-            ("distribution: rke2\n", Distribution::Rke2.min_memory_mib()),
-        ] {
-            let mut host = facts();
-            host.memory_mib = memory_mib;
-            let plan = plan(&index, &config(extra), &host).unwrap();
-            let idle = plan.memory.cluster_mib + plan.memory.components_mib;
-            assert!(idle < host.memory_mib * 4 / 5, "{idle} MiB");
-            assert!(plan.warnings.iter().all(|w| w.code != "memory.tight"));
-        }
-    }
-
-    #[test]
     fn a_single_node_install_counts_what_the_catalog_measured_on_its_distribution() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let logs = index.component("logs/victoria-logs").unwrap();
         for distribution in Distribution::ALL {
             let config = config(&format!(
@@ -2587,7 +2757,7 @@ mod tests {
                 .find(|c| c.id == "logs/victoria-logs");
             assert_eq!(
                 planned.and_then(|c| c.idle_memory_mib),
-                logs.idle_memory_mib(distribution.id(), "arm64"),
+                logs.idle_memory_mib(distribution.id(), "single-node", "arm64"),
                 "{}",
                 distribution.id()
             );
@@ -2595,33 +2765,47 @@ mod tests {
     }
 
     #[test]
-    fn rke2_is_refused_on_a_4_gib_server_and_k3s_is_not() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+    #[ignore = "the pinned catalog has no measurements yet"]
+    fn a_4_gib_server_takes_the_defaults_without_the_builder_or_a_warning() {
+        let index = crate::catalog::pinned();
         let mut host = facts();
         host.memory_mib = 3793;
-        assert!(plan(&index, &config(""), &host).is_ok());
-        let Err(PlanError::TeamMemory {
-            distribution, have, ..
-        }) = plan(&index, &config("distribution: rke2\n"), &host)
-        else {
-            panic!("RKE2 on {} MiB", host.memory_mib);
-        };
-        assert_eq!((distribution, have), (Distribution::Rke2, 3793));
-        host.memory_mib = Distribution::Rke2.min_memory_mib();
-        assert!(plan(&index, &config("distribution: rke2\n"), &host).is_ok());
+        for extra in ["", "distribution: rke2\n"] {
+            let plan = plan(&index, &config(extra), &host).unwrap();
+            assert!(!ids(&plan).contains(&"builds/zeabur-builder"));
+            assert!(plan.left_out.contains_key("builds/zeabur-builder"));
+            let idle = plan.memory.cluster_mib + plan.memory.components_mib;
+            assert!(idle < host.memory_mib * 4 / 5, "{idle} MiB");
+            assert!(plan.warnings.iter().all(|w| w.code != "memory.tight"));
+        }
     }
 
     #[test]
     fn the_builder_is_left_out_where_one_build_would_not_fit() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let builder = index.component("builds/zeabur-builder").unwrap();
         for distribution in Distribution::ALL {
             let config = config(&format!(
                 "distribution: {}\nenable: [builds/zeabur-builder]\n",
                 distribution.id()
             ));
-            let needs = min_memory_mib(builder, distribution).unwrap();
-            assert!(needs > distribution.min_memory_mib());
+            let selection =
+                select::select(&index, &config, &Target::team(&config, "arm64")).unwrap();
+            let all: Vec<&str> = selection
+                .components
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
+            let needs = min_memory_mib(
+                builder,
+                &index,
+                &all,
+                distribution,
+                "arm64",
+                pins::PRODUCTS.as_ref(),
+            )
+            .unwrap();
+            assert!(needs > least_memory(&index, &config));
             let mut host = facts();
             host.memory_mib = needs - 1;
             let short = plan(&index, &config, &host).unwrap();
@@ -2638,7 +2822,7 @@ mod tests {
 
     #[test]
     fn the_kubelet_keeps_memory_from_pods_and_evicts_before_it_runs_out() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         for (extra, path, kube_reserved) in [
             (
                 "",
@@ -2673,24 +2857,65 @@ mod tests {
     }
 
     #[test]
-    fn node_sources_are_the_vxlan_addresses_of_calico_or_canal() {
+    fn a_calico_node_without_its_vxlan_address_is_waiting() {
+        let nodes = json!({"items": [{
+            "metadata": {"name": "vps-1", "annotations": {}},
+            "spec": {"podCIDRs": ["10.42.0.0/24"]},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }]});
+        assert_eq!(
+            node_sources(Distribution::K3s, &nodes),
+            Err(NodeWaiting("vps-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_node_that_is_not_ready_is_skipped_not_waited_for() {
+        let nodes = json!({"items": [
+            {
+                "metadata": {"name": "vps-1", "annotations": {
+                    "projectcalico.org/IPv4VXLANTunnelAddr": "10.42.8.64",
+                }},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            },
+            {
+                "metadata": {"name": "vps-2", "annotations": {}},
+                "spec": {"podCIDRs": ["10.42.1.0/24"]},
+                "status": {"conditions": [{"type": "Ready", "status": "Unknown"}]},
+            },
+        ]});
+        assert_eq!(
+            node_sources(Distribution::K3s, &nodes).unwrap(),
+            ["10.42.8.64"]
+        );
+    }
+
+    #[test]
+    fn calico_nodes_are_their_vxlan_addresses_not_their_pod_range() {
         let nodes = json!({"items": [
             {
                 "metadata": {"annotations": {
                     "projectcalico.org/IPv4VXLANTunnelAddr": "10.42.8.64",
                 }},
                 "spec": {"podCIDRs": ["10.42.0.0/24"]},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
             },
-            {"metadata": {}, "spec": {"podCIDRs": ["10.42.1.0/24", "fd00:42:1::/64"]}},
+            {
+                "metadata": {"annotations": {
+                    "projectcalico.org/IPv4VXLANTunnelAddr": "10.42.17.128",
+                    "projectcalico.org/IPv6VXLANTunnelAddr": "fd00:42::1",
+                }},
+                "spec": {"podCIDRs": ["10.42.1.0/24"]},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            },
         ]});
         assert_eq!(
-            node_sources(&nodes),
-            ["10.42.1.0", "10.42.8.64", "fd00:42:1::"]
+            node_sources(Distribution::K3s, &nodes).unwrap(),
+            ["10.42.17.128", "10.42.8.64", "fd00:42::1"]
         );
     }
 
-    /// The record an `apply` of `plan` writes, from an installer at `installer`, with the
-    /// components and chart versions an older catalog had.
+    /// The record an `apply` of `plan` writes, from an installer at `installer`, edited by `edit`.
     fn recorded(plan: &Plan, installer: &str, edit: impl FnOnce(&mut Value)) -> Record {
         let mut summary = json!(plan);
         edit(&mut summary);
@@ -2709,11 +2934,11 @@ mod tests {
         .unwrap()
     }
 
+    /// Traefik's chart version in an older catalog.
     fn older_catalog(summary: &mut Value) {
-        let components = summary["components"].as_array_mut().unwrap();
-        components.retain(|c| c["id"] != "builds/zeabur-builder");
-        components.push(json!({"id": "container-registry/zot", "releases": []}));
-        for c in components
+        for c in summary["components"]
+            .as_array_mut()
+            .unwrap()
             .iter_mut()
             .filter(|c| c["id"] == "ingress/traefik")
         {
@@ -2727,11 +2952,11 @@ mod tests {
 
     #[test]
     fn an_upgrade_below_the_minimum_keeps_what_runs_and_warns() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let config = config("enable: [builds/zeabur-builder]\n");
         let first = plan(&index, &config, &facts()).unwrap();
         let mut small = facts();
-        small.memory_mib = 2882;
+        small.memory_mib = least_memory(&index, &config) - 1;
         assert!(matches!(
             plan(&index, &config, &small),
             Err(PlanError::TeamMemory { .. })
@@ -2749,19 +2974,16 @@ mod tests {
     }
 
     #[test]
-    fn an_old_id_in_the_record_is_removed_and_the_new_default_added() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+    fn an_upgrade_reports_the_chart_versions_and_release_it_changes() {
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
         assert_eq!(first.changes, None);
 
         let mut upgrade = facts();
         upgrade.record = Some(recorded(&first, "0.0.1", older_catalog));
         let plan = plan(&index, &config(""), &upgrade).unwrap();
-        assert!(ids(&plan).contains(&"builds/zeabur-builder"));
-        assert!(!ids(&plan).contains(&"container-registry/zot"));
         let changes = plan.changes.unwrap();
-        assert_eq!(changes.added, ["builds/zeabur-builder"]);
-        assert_eq!(changes.removed, ["container-registry/zot"]);
+        assert!(changes.added.is_empty() && changes.removed.is_empty());
         let traefik = changes
             .charts
             .iter()
@@ -2776,44 +2998,94 @@ mod tests {
     }
 
     #[test]
-    fn installing_builder_on_a_zot_server_warns_that_it_deletes_images() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+    fn a_changed_access_domain_is_a_change() {
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
-        let deletes = |p: &Plan| p.warnings.iter().any(|w| w.code == "builder.deletesImages");
-        assert!(!deletes(&first));
+        let issuer = first.identity.as_ref().unwrap().issuer.clone();
 
-        let mut upgrade = facts();
-        upgrade.record = Some(recorded(&first, "0.0.1", older_catalog));
-        assert!(deletes(&plan(&index, &config(""), &upgrade).unwrap()));
-        let kept = plan(
-            &index,
-            &config("disable: [builds/zeabur-builder]\n"),
-            &upgrade,
-        )
-        .unwrap();
-        assert!(!deletes(&kept));
+        let mut same = facts();
+        same.record = Some(recorded(&first, "0.0.1", |_| {}));
+        let unchanged = plan(&index, &config(""), &same).unwrap();
+        assert_eq!(unchanged.changes.unwrap().urls, []);
+
+        let mut moved = facts();
+        moved.record = Some(recorded(&first, "0.0.1", |summary| {
+            summary["identity"]["issuer"] = json!("https://old-identity.example.com");
+        }));
+        let changes = plan(&index, &config(""), &moved).unwrap().changes.unwrap();
+        assert_eq!(
+            changes.urls,
+            [record::UrlChange {
+                name: "Zeabur Identity".to_owned(),
+                from: "https://old-identity.example.com".to_owned(),
+                to: issuer,
+            }]
+        );
     }
 
     #[test]
-    fn with_builder_disabled_the_old_zot_is_kept() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
-        let first = plan(&index, &config(""), &facts()).unwrap();
-        let mut upgrade = facts();
-        upgrade.record = Some(recorded(&first, "0.0.1", older_catalog));
-        let plan = plan(
-            &index,
-            &config("disable: [builds/zeabur-builder]\n"),
-            &upgrade,
+    fn an_upgrade_names_the_zeabur_and_identity_releases_it_installs() {
+        let index = crate::catalog::pinned();
+        let pinned = pins::Products {
+            catalog: pins::Catalog {
+                version: "v0.1.0",
+                index_sha256: "aa",
+            },
+            identity: pins::Identity {
+                version: "v0.2.0",
+                image: "ghcr.io/zeabur-oss/identity@sha256:bb",
+                identityctl_amd64: "cc",
+                identityctl_arm64: "dd",
+                request_memory_mib: 24,
+            },
+            zeabur: pins::Zeabur {
+                version: "v0.3.0",
+                image: "ghcr.io/zeabur-oss/zeabur@sha256:ee",
+                chart_sha256: "ff",
+            },
+        };
+        let config = Config::parse(
+            "access: {mode: domain, identity: login.example.com, zeabur: zeabur.example.com}",
         )
         .unwrap();
-        let changes = plan.changes.unwrap();
-        assert_eq!(changes.removed, Vec::<String>::new());
-        assert_eq!(changes.kept, ["container-registry/zot"]);
+        let plan = |facts: &Facts| plan_with(&index, &config, facts, Some(&pinned)).unwrap();
+        let first = plan(&facts());
+        let change = |name: &str, from: Option<&str>, to: &str| record::ProductChange {
+            name: name.to_owned(),
+            from: from.map(str::to_owned),
+            to: to.to_owned(),
+        };
+
+        let mut same = facts();
+        same.record = Some(recorded(&first, "0.0.1", |_| {}));
+        assert_eq!(plan(&same).changes.unwrap().products, []);
+
+        let mut older = facts();
+        older.record = Some(recorded(&first, "0.0.1", |summary| {
+            summary["zeabur"]["version"] = json!("v0.2.9");
+        }));
+        assert_eq!(
+            plan(&older).changes.unwrap().products,
+            [change("Zeabur", Some("v0.2.9"), "v0.3.0")]
+        );
+
+        let mut unrecorded = facts();
+        unrecorded.record = Some(recorded(&first, "0.0.1", |summary| {
+            summary["identity"]["version"] = Value::Null;
+            summary["zeabur"]["version"] = Value::Null;
+        }));
+        assert_eq!(
+            plan(&unrecorded).changes.unwrap().products,
+            [
+                change("Zeabur Identity", None, "v0.2.0"),
+                change("Zeabur", None, "v0.3.0"),
+            ]
+        );
     }
 
     #[test]
     fn a_charted_component_the_catalog_dropped_is_kept_not_removed() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
         let mut upgrade = facts();
         upgrade.record = Some(recorded(&first, "0.0.1", |summary| {
@@ -2830,8 +3102,9 @@ mod tests {
 
     #[test]
     fn a_left_out_component_without_a_chart_is_kept_not_removed() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
-        let first = plan(&index, &config(""), &facts()).unwrap();
+        let index = crate::catalog::pinned();
+        let enabled = config("enable: [node-updates/system-upgrade-controller]\n");
+        let first = plan(&index, &enabled, &facts()).unwrap();
         let mut upgrade = facts();
         upgrade.record = Some(recorded(&first, "0.0.1", |_| {}));
         let plan = plan(
@@ -2847,7 +3120,7 @@ mod tests {
 
     #[test]
     fn a_default_the_install_record_lacks_is_installed() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
         let mut upgrade = facts();
         upgrade.record = Some(recorded(&first, "0.0.1", |summary| {
@@ -2861,7 +3134,7 @@ mod tests {
 
     #[test]
     fn a_rerun_with_the_same_catalog_changes_nothing() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
         let mut again = facts();
         let mut record = recorded(&first, record::INSTALLER_VERSION, |_| {});
@@ -2877,7 +3150,7 @@ mod tests {
 
     #[test]
     fn a_changed_chart_value_is_reported_with_the_same_versions() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
         let mut again = facts();
         let mut record = recorded(&first, record::INSTALLER_VERSION, |summary| {
@@ -2904,7 +3177,7 @@ mod tests {
 
     #[test]
     fn a_record_from_a_newer_installer_stops_the_plan() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
+        let index = crate::catalog::pinned();
         let first = plan(&index, &config(""), &facts()).unwrap();
         let mut newer = facts();
         newer.record = Some(recorded(&first, "999.0.0", |_| {}));
@@ -2918,20 +3191,21 @@ mod tests {
     }
 
     #[test]
-    fn an_old_id_in_enable_or_disable_stops_the_plan_and_names_the_new_id() {
-        let index = Index::parse(INDEX.as_bytes()).unwrap();
-        for field in ["enable", "disable"] {
-            let error = plan(
-                &index,
-                &config(&format!("{field}: [container-registry/zot]\n")),
-                &facts(),
-            )
-            .unwrap_err();
-            assert!(matches!(error, PlanError::Renamed { .. }), "{error}");
+    fn only_a_host_that_restricts_unconfined_gets_containerds_apparmor_profile() {
+        let index = crate::catalog::pinned();
+        let restricted = Facts {
+            apparmor_restricts_unconfined: true,
+            ..facts()
+        };
+        for extra in ["", "distribution: rke2\n"] {
+            let plain = plan(&index, &config(extra), &facts()).unwrap();
             assert!(
-                error.to_string().contains("`builds/zeabur-builder`"),
-                "{error}"
+                !plain
+                    .host_file_paths
+                    .contains(&cluster::APPARMOR_PROFILE.to_owned())
             );
+            let stacked = plan(&index, &config(extra), &restricted).unwrap();
+            assert!(stacked.host_files.contains(&cluster::apparmor_profile()));
         }
     }
 }

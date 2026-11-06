@@ -5,7 +5,7 @@ description: YAML fields, defaults, and secret file formats for creating a clust
 
 Put domains, component choices, and host settings in YAML, then run `zeabur-installer --config config.yaml plan` to preview the installation. The default file path is `/etc/zeabur-installer/config.yaml`. Field names are camelCase. The installer stops on misspelled or unknown fields.
 
-The web interface saves its choices to this same file. For installation through the web interface, see [Install Zeabur on a server](../get-started/quickstart.mdx). For command-line installation, see [Install with a configuration file and commands](../get-started/advanced-install.mdx). For command options, see [Installer commands](./installer.mdx).
+The web interface saves its choices to this same file. For installation through the web interface, see [Install Zeabur on a server](../get-started/quickstart.mdx). For command-line installation, see [Install with a configuration file and commands](../install/config-file.mdx). For command options, see [Installer commands](./installer.mdx).
 
 ## Configuration for creating a cluster
 
@@ -71,7 +71,9 @@ enable: [runtime-security, vulnerability-scanning, intrusion-prevention]
 
 `enable` accepts capabilities, such as `runtime-security`, or full component IDs, such as `volume-backup/velero`. The installer adds a component's dependencies with it. If `disable` excludes a component that another component needs, `plan` names both and stops. The `plan` output lists the final components, their installation order, and the reasons for exclusions. When the Catalog renames a component, an old ID in `enable` or `disable` stops `plan` with an error that names the new ID.
 
-The installer offers only components the Catalog has tested on your distribution. Each component lists them under `testedOn` in the Catalog's `index.json`. A recommended component that wasn't tested on your distribution is left out, and so is anything that needs it. If `enable` names an untested component, or a component you enabled needs one, `plan` installs it and warns that it wasn't tested there.
+Each component lists the distributions and platforms, such as `linux/arm64`, that the Catalog tested it on under `testedOn` in the Catalog's `index.json`. A component that wasn't tested on your distribution and your server's platform is still offered and installed. The installer marks it untested, and `plan` warns that it wasn't tested there.
+
+A component also lists the Kubernetes versions it runs on under `kubeVersion`. If your cluster's version isn't one of them, the installer leaves the component out, and `plan` warns when `enable` names it.
 
 The next `apply` removes any component you take off the list. If removing a component also deletes its data, add it to `allowDataLoss` first. See [Remove a component](./installer.mdx#remove-components).
 
@@ -79,12 +81,12 @@ The next `apply` removes any component you take off the list. If removing a comp
 inputs:
   volume-backup/velero:
     bucket: backups
-    s3-url: https://s3.example.com
+    s3Url: https://s3.example.com
 ```
 
 The Catalog defines each component's inputs and their types. If a required value is missing, `plan` names the field to add.
 
-The installer fills in `cluster-ip` for Zeabur Builder (zot's fixed address). A value in `inputs` overrides it.
+The installer fills in `clusterIp` for Zeabur Builder (zot's fixed address). A value in `inputs` overrides it.
 
 Velero's `region` input is the bucket's region. It defaults to `us-east-1`; Cloudflare R2 needs `auto`. The web interface asks for the access key ID and secret access key separately and writes the `credentials` file from them.
 
@@ -112,7 +114,7 @@ The installer always creates `local-path`, which stores data on the node at `/va
 - When Longhorn becomes the default, the installer changes its previously default `local-path` to a non-default class.
 - If the cluster already has another default class, the installer keeps it. If this installation would make Longhorn the default, `apply` stops. Remove the default annotation from the existing class, then run it again.
 
-When Longhorn is selected, `apply` installs the iSCSI initiator and NFS client on this host, loads `iscsi_tcp`, and starts `iscsid`. Every node running Longhorn needs these. See [Add nodes](../cluster/nodes.mdx).
+When Longhorn is selected, `apply` installs the iSCSI initiator and NFS client on this host, loads `iscsi_tcp` and `dm_crypt`, and starts `iscsid`. Every node running Longhorn needs these. See [Add nodes](../cluster/nodes.mdx).
 
 ### `distribution` and versions
 
@@ -142,7 +144,7 @@ A node keeps the name it was installed with. Running `apply` again reuses it, an
 
 Release builds of the installer don't need `sources`. They pin versions of Zeabur Catalog, Zeabur Identity, and Zeabur, download them to `/var/lib/rancher/zeabur-installer/downloads`, and check them against SHA-256 hashes compiled into the installer.
 
-Use `sources` to install your own builds, usually for development and testing. Specify only the fields you want to override; the rest keep their pinned versions. A development build of the installer that you compile yourself doesn't pin any versions, so you must specify `catalog`, `identityImage`, `identityctl`, `zeaburImage`, and `zeaburChart`. `plan` lists any that are missing. Replace the paths with the files you've prepared:
+Use `sources` to install your own builds, usually for development and testing. Specify only the fields you want to override; the rest keep their pinned versions. A development build of the installer that you compile yourself doesn't pin any versions, so you must specify `catalog`, `identityImage`, `identityctl`, `zeaburImage`, and `zeaburChart`. `plan` lists any that are missing, and stops when a path doesn't exist or is a directory where a file belongs. Only `zeaburChart` can be a directory. Replace the paths with the files you've prepared:
 
 ```yaml
 sources:
@@ -168,7 +170,7 @@ An archive removed from `imageArchives` is also removed from the K3s or RKE2 imp
 
 ## Configuration for personal use
 
-With `use: personal` at the top level, the installer installs KubeSolo and components, without the Zeabur dashboard or Zeabur Identity. For instructions and limitations, see [Personal use: Install on a small machine](../get-started/personal.mdx).
+With `use: personal` at the top level, the installer installs KubeSolo and components, without the Zeabur dashboard or Zeabur Identity. For instructions and limitations, see [Personal use: Install on a small machine](../install/personal.mdx).
 
 ```yaml title="/etc/zeabur-installer/config.yaml"
 use: personal
@@ -181,7 +183,7 @@ Only the fields in the table below can appear alongside it. `profile`, `access`,
 
 | Field | Default and purpose |
 |---|---|
-| `enable` | `[]`. A personal install gets the components the Catalog recommends for `single-node` and has tested on KubeSolo, such as ingress and certificates. You can add other components tested on KubeSolo, such as `builds` and `databases`. `builds` is Zeabur Builder with zot and needs at least 1800 MiB of memory. A component not tested on KubeSolo is installed with a warning |
+| `enable` | `[]`. A personal install gets the components the Catalog recommends for `single-node`, such as ingress and certificates. You can add other components, such as `builds` and `databases`. `builds` is Zeabur Builder with zot and needs at least 1800 MiB of memory. A component not tested on KubeSolo is installed with a warning |
 | `disable` | `[]`. Capabilities or full component IDs to exclude |
 | `allowDataLoss` | `[]`. Same as in the configuration for creating a cluster |
 | `inputs` | `{}`. Same as in the configuration for creating a cluster, grouped by component ID |
